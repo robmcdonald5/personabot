@@ -1,5 +1,7 @@
 """Tests for quality filters."""
 
+from factories import make_message
+
 from personabot.pipeline.filters import (
     is_long_enough,
     is_not_bot_command,
@@ -12,18 +14,9 @@ from personabot.schemas.discord import DiscordMessage
 
 
 def _msg(content: str, word_count: int | None = None) -> DiscordMessage:
+    """make_message with content-first signature for filter tests."""
     wc = word_count if word_count is not None else len(content.split())
-    return DiscordMessage(
-        message_id=1,
-        guild_id=1,
-        channel_id=1,
-        channel_name="test-channel",
-        author_id=1,
-        author_name="test",
-        content=content,
-        timestamp="2026-01-01T00:00:00Z",
-        word_count=wc,
-    )
+    return make_message(content=content, word_count=wc)
 
 
 # --- is_long_enough ---

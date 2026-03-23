@@ -1,27 +1,17 @@
 """Tests for database query functions."""
 
+from factories import make_message
+
 from personabot.db import queries
-from personabot.schemas.discord import DiscordMessage, JobStatus
+from personabot.schemas.discord import JobStatus
 
-# --- Helpers ---
+# DB tests use these specific IDs for query assertions
+_DB = dict(guild_id=100, channel_id=200, author_id=300, author_name="testuser")
 
 
-def _make_message(**overrides) -> DiscordMessage:
-    """Create a DiscordMessage with sensible defaults."""
-    defaults = dict(
-        message_id=1,
-        guild_id=100,
-        channel_id=200,
-        channel_name="test-channel",
-        author_id=300,
-        author_name="testuser",
-        content="Hello world, this is a test message",
-        timestamp="2026-03-17T12:00:00Z",
-        reaction_count=0,
-        word_count=7,
-    )
-    defaults.update(overrides)
-    return DiscordMessage(**defaults)
+def _msg(**overrides):
+    """make_message with DB-specific defaults."""
+    return make_message(**{**_DB, **overrides})
 
 
 # --- Guild config ---
@@ -150,7 +140,7 @@ async def test_get_active_scrape_jobs(db_connection):
 
 
 async def test_upsert_message(db_connection):
-    msg = _make_message()
+    msg = _msg()
     await queries.upsert_message(db_connection, msg)
     await db_connection.commit()
 
@@ -162,11 +152,11 @@ async def test_upsert_message(db_connection):
 
 async def test_upsert_message_idempotent(db_connection):
     """Re-upserting the same message updates mutable fields."""
-    msg = _make_message(reaction_count=0)
+    msg = _msg(reaction_count=0)
     await queries.upsert_message(db_connection, msg)
     await db_connection.commit()
 
-    updated = _make_message(reaction_count=5)
+    updated = _msg(reaction_count=5)
     await queries.upsert_message(db_connection, updated)
     await db_connection.commit()
 
@@ -176,7 +166,7 @@ async def test_upsert_message_idempotent(db_connection):
 
 
 async def test_upsert_messages_batch(db_connection):
-    messages = [_make_message(message_id=i, content=f"msg {i}") for i in range(10)]
+    messages = [_msg(message_id=i, content=f"msg {i}") for i in range(10)]
     count = await queries.upsert_messages_batch(db_connection, messages)
     await db_connection.commit()
     assert count == 10
@@ -186,7 +176,7 @@ async def test_upsert_messages_batch(db_connection):
 
 
 async def test_get_user_messages_with_limit(db_connection):
-    messages = [_make_message(message_id=i) for i in range(20)]
+    messages = [_msg(message_id=i) for i in range(20)]
     await queries.upsert_messages_batch(db_connection, messages)
     await db_connection.commit()
 
@@ -196,7 +186,7 @@ async def test_get_user_messages_with_limit(db_connection):
 
 async def test_get_messages_by_ids(db_connection):
     """Fetch a subset of messages by ID."""
-    messages = [_make_message(message_id=i, content=f"msg {i}") for i in range(1, 6)]
+    messages = [_msg(message_id=i, content=f"msg {i}") for i in range(1, 6)]
     await queries.upsert_messages_batch(db_connection, messages)
     await db_connection.commit()
 
@@ -214,7 +204,7 @@ async def test_get_messages_by_ids_empty(db_connection):
 
 async def test_get_messages_by_ids_missing(db_connection):
     """Nonexistent IDs are silently excluded."""
-    msg = _make_message(message_id=1)
+    msg = _msg(message_id=1)
     await queries.upsert_message(db_connection, msg)
     await db_connection.commit()
 
@@ -228,7 +218,7 @@ async def test_get_messages_by_ids_missing(db_connection):
 
 
 async def test_save_and_get_media(db_connection):
-    msg = _make_message()
+    msg = _msg()
     await queries.upsert_message(db_connection, msg)
     await db_connection.commit()
 
@@ -255,8 +245,7 @@ async def test_save_and_get_media(db_connection):
 
 async def test_get_user_stats(db_connection):
     messages = [
-        _make_message(message_id=i, word_count=10, reaction_count=i)
-        for i in range(1, 6)
+        _msg(message_id=i, word_count=10, reaction_count=i) for i in range(1, 6)
     ]
     await queries.upsert_messages_batch(db_connection, messages)
     await db_connection.commit()
@@ -274,8 +263,8 @@ async def test_get_server_stats(db_connection):
     await db_connection.commit()
 
     messages = [
-        _make_message(message_id=1, author_id=300, channel_id=10),
-        _make_message(message_id=2, author_id=400, channel_id=20, author_name="other"),
+        _msg(message_id=1, author_id=300, channel_id=10),
+        _msg(message_id=2, author_id=400, channel_id=20, author_name="other"),
     ]
     await queries.upsert_messages_batch(db_connection, messages)
     await db_connection.commit()
@@ -292,7 +281,7 @@ async def test_get_server_stats(db_connection):
 
 async def test_delete_expired_media(db_connection):
     """Expired media records are deleted and paths returned."""
-    msg = _make_message()
+    msg = _msg()
     await queries.upsert_message(db_connection, msg)
     await queries.save_downloaded_media(
         db_connection,
@@ -315,7 +304,7 @@ async def test_delete_expired_media(db_connection):
 
 async def test_delete_expired_messages(db_connection):
     """Expired messages are deleted and count returned."""
-    messages = [_make_message(message_id=i) for i in range(5)]
+    messages = [_msg(message_id=i) for i in range(5)]
     await queries.upsert_messages_batch(db_connection, messages)
     await db_connection.commit()
 
