@@ -1,6 +1,7 @@
 """Application configuration using pydantic-settings."""
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -19,8 +20,20 @@ class Settings(BaseSettings):
     discord_token: str
     dev_guild_id: int | None = None  # Set for instant command sync during development
 
-    # Database
-    db_path: str = "data/personabot.db"
+    # Storage — all paths derived from data_dir
+    data_dir: Path = Path("data")
+
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / "personabot.db"
+
+    @property
+    def media_dir(self) -> Path:
+        return self.data_dir / "media"
+
+    @property
+    def exports_dir(self) -> Path:
+        return self.data_dir / "exports"
 
     # Scraping defaults
     default_limit: int = 10000

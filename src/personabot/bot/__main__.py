@@ -14,6 +14,7 @@ def main() -> None:
     )
 
     settings = get_settings()
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
     db_manager = DatabaseManager(db_path=settings.db_path)
     bot = PersonaBot(db_manager=db_manager, settings=settings)
     bot.run(settings.discord_token)

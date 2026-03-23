@@ -109,7 +109,9 @@ class PersonaBot(commands.Bot):
             # Run concurrently (no FK dependency between jobs and exports)
             job_count, export_count = await asyncio.gather(
                 queries.delete_expired_scrape_jobs(db, cutoff),
-                self._cleanup_expired_files(expired_paths, cutoff_ts),
+                self._cleanup_expired_files(
+                    expired_paths, cutoff_ts, self.settings.exports_dir
+                ),
             )
             await db.commit()  # Commit job deletions
 
@@ -127,7 +129,9 @@ class PersonaBot(commands.Bot):
             logger.exception("Retention cleanup failed")
 
     @staticmethod
-    async def _cleanup_expired_files(expired_paths: list[str], cutoff_ts: float) -> int:
+    async def _cleanup_expired_files(
+        expired_paths: list[str], cutoff_ts: float, exports_dir: Path
+    ) -> int:
         """Delete expired media files and export files. Runs I/O in a thread."""
 
         def _do_cleanup() -> int:
@@ -142,7 +146,6 @@ class PersonaBot(commands.Bot):
 
             # Clean up expired export files
             export_count = 0
-            exports_dir = Path("data/exports")
             if exports_dir.exists():
                 for jsonl_file in exports_dir.rglob("*.jsonl"):
                     if jsonl_file.stat().st_mtime < cutoff_ts:

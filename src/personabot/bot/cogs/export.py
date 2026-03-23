@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from personabot.bot.client import PersonaBot
+from personabot.config import Settings
 from personabot.db import queries
 from personabot.pipeline.export import (
     build_user_corpus,
@@ -22,9 +23,9 @@ from personabot.pipeline.windowing import create_windows, inject_reply_context
 logger = logging.getLogger(__name__)
 
 
-def _export_path(guild_id: int, user_id: int) -> Path:
+def _export_path(settings: Settings, guild_id: int, user_id: int) -> Path:
     """Canonical export file path for a user in a guild."""
-    return Path(f"data/exports/{guild_id}/{user_id}/corpus.jsonl")
+    return settings.exports_dir / str(guild_id) / str(user_id) / "corpus.jsonl"
 
 
 class ExportCog(commands.Cog):
@@ -112,12 +113,14 @@ class ExportCog(commands.Cog):
             windows=selected,
         )
 
-        # 7. Export JSONL (blocking I/O — run in thread)
+        # 6. Export JSONL (blocking I/O — run in thread)
         export_file = await asyncio.to_thread(
-            export_jsonl, corpus, str(_export_path(guild.id, user.id))
+            export_jsonl,
+            corpus,
+            _export_path(self.bot.settings, guild.id, user.id),
         )
 
-        # 8. Build result embed
+        # 7. Build result embed
         embed = discord.Embed(
             title=f"Corpus Export: {user.display_name}",
             color=discord.Color.teal(),
@@ -143,7 +146,7 @@ class ExportCog(commands.Cog):
             text=f"Data expires in {hours} hours. Download this file to keep it."
         )
 
-        # 9. Send as Discord attachment (or fallback if too large)
+        # 8. Send as Discord attachment (or fallback if too large)
         file_size = export_file.stat().st_size
         max_attachment = 25 * 1024 * 1024  # 25 MB
 
@@ -172,7 +175,7 @@ class ExportCog(commands.Cog):
         guild = interaction.guild
         assert guild is not None  # Guaranteed by guild_only
 
-        export_path = _export_path(guild.id, user.id)
+        export_path = _export_path(self.bot.settings, guild.id, user.id)
         if not export_path.exists():
             await interaction.response.send_message(
                 f"No export found for {user.mention}. "
@@ -235,7 +238,7 @@ class ExportCog(commands.Cog):
 
         lines = []
         for u in top_users:
-            ep = _export_path(guild.id, u.author_id)
+            ep = _export_path(self.bot.settings, guild.id, u.author_id)
             status = "exported" if ep.exists() else "not exported"
             lines.append(f"**{u.author_name}** -- {u.message_count:,} msgs ({status})")
 

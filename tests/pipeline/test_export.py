@@ -87,7 +87,7 @@ def test_build_user_corpus():
 def test_export_jsonl(tmp_path):
     windows = [_window("w_001"), _window("w_002")]
     corpus = build_user_corpus(300, "test", 100, "Server", windows)
-    out = export_jsonl(corpus, str(tmp_path / "corpus.jsonl"))
+    out = export_jsonl(corpus, tmp_path / "corpus.jsonl")
     assert out.exists()
     with open(out) as f:
         lines = f.readlines()

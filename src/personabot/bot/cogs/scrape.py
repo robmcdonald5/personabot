@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-import uuid
+import secrets
 from pathlib import Path
 
 import aiosqlite
@@ -76,7 +76,7 @@ class ScrapeCog(commands.Cog):
         excluded_users = set(cfg.excluded_users) if cfg else set()
 
         # Create job record
-        job_id = str(uuid.uuid4())[:12]
+        job_id = secrets.token_hex(6)
         await queries.upsert_guild_config(db, guild.id, guild.name)
         await queries.create_scrape_job(
             db,
@@ -125,6 +125,7 @@ class ScrapeCog(commands.Cog):
     ) -> None:
         """Background scrape task. Limit is global across all channels."""
         db = self.bot.db_manager.get_connection()
+        media_threshold = self.bot.settings.media_reaction_threshold
         total_found = 0
         total_stored = 0
         batch: list[DiscordMessage] = []
@@ -179,10 +180,7 @@ class ScrapeCog(commands.Cog):
                     batch.append(dm)
 
                     # Download media for messages meeting reaction threshold
-                    if (
-                        dm.reaction_count >= self.bot.settings.media_reaction_threshold
-                        and message.attachments
-                    ):
+                    if dm.reaction_count >= media_threshold and message.attachments:
                         for att in message.attachments:
                             if att.content_type and att.content_type.startswith(
                                 "image/"
@@ -275,7 +273,7 @@ class ScrapeCog(commands.Cog):
         attachment: discord.Attachment,
     ) -> None:
         """Download a media attachment to local storage."""
-        local_dir = Path(f"data/media/{guild_id}/{message_id}")
+        local_dir = self.bot.settings.media_dir / str(guild_id) / str(message_id)
         await asyncio.to_thread(local_dir.mkdir, parents=True, exist_ok=True)
         safe_name = Path(attachment.filename).name  # Strip any directory components
         local_path = local_dir / safe_name

@@ -77,16 +77,15 @@ def build_user_corpus(
     )
 
 
-def export_jsonl(corpus: UserCorpus, output_path: str) -> Path:
+def export_jsonl(corpus: UserCorpus, output_path: Path) -> Path:
     """Write corpus to a JSONL file (one JSON object per line).
 
     Line 1: corpus metadata (without windows).
     Lines 2+: one ConversationWindow per line.
     """
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(path, "w", encoding="utf-8") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         # Line 1: metadata without windows
         metadata = corpus.model_dump(exclude={"windows"})
         f.write(json.dumps(metadata, default=str) + "\n")
@@ -94,4 +93,4 @@ def export_jsonl(corpus: UserCorpus, output_path: str) -> Path:
         for window in corpus.windows:
             f.write(window.model_dump_json() + "\n")
 
-    return path
+    return output_path
