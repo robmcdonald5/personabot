@@ -142,6 +142,4 @@ class StatsCog(commands.Cog):
 
 
 async def setup(bot: PersonaBot) -> None:
-    cog = StatsCog(bot)
-    bot.pb.add_command(cog.stats)
-    await bot.add_cog(cog)
+    await bot.add_cog(StatsCog(bot))

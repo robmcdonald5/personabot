@@ -38,10 +38,10 @@ class PersonaBot(commands.Bot):
 
         # Shared top-level command group — all cogs attach subgroups to this
         # guild_only=True prevents DM usage for all subcommands
+        # Shared top-level command group — cogs attach subgroups in their setup()
         self.pb = app_commands.Group(
             name="pb", description="PersonaBot commands", guild_only=True
         )
-        self.tree.add_command(self.pb)
 
     async def setup_hook(self) -> None:
         """Called before the bot connects. Load DB and cogs."""
@@ -57,6 +57,14 @@ class PersonaBot(commands.Bot):
         for ext in cog_extensions:
             await self.load_extension(ext)
             logger.info("Loaded extension: %s", ext)
+
+        # Move cog command groups under the /pb parent.
+        # add_cog registers each group as top-level; we relocate them.
+        for name in ("config", "scrape", "export", "stats"):
+            cmd = self.tree.remove_command(name)
+            if cmd is not None:
+                self.pb.add_command(cmd)
+        self.tree.add_command(self.pb)
 
         # Start the retention cleanup loop
         self.retention_cleanup.start()

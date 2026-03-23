@@ -251,6 +251,4 @@ class ExportCog(commands.Cog):
 
 
 async def setup(bot: PersonaBot) -> None:
-    cog = ExportCog(bot)
-    bot.pb.add_command(cog.export)
-    await bot.add_cog(cog)
+    await bot.add_cog(ExportCog(bot))

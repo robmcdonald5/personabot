@@ -390,6 +390,4 @@ class ScrapeCog(commands.Cog):
 
 
 async def setup(bot: PersonaBot) -> None:
-    cog = ScrapeCog(bot)
-    bot.pb.add_command(cog.scrape)
-    await bot.add_cog(cog)
+    await bot.add_cog(ScrapeCog(bot))
