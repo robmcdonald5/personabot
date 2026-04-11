@@ -59,11 +59,11 @@ def calculate_score(
     }
     total = sum(breakdown.values())
 
-    # Use model_construct to avoid serialize-then-revalidate overhead.
-    # The data is already validated since it came from a DiscordMessage instance.
+    # model_construct skips re-validation — data comes from an already-validated
+    # DiscordMessage. model_dump() is the public, forward-compatible way to
+    # extract field data (safer than reaching into msg.__dict__).
     return ScoredMessage.model_construct(
-        _fields_set=msg.model_fields_set | {"score", "score_breakdown"},
-        **msg.__dict__,
+        **msg.model_dump(),
         score=round(total, 4),
         score_breakdown=breakdown,
     )
@@ -73,16 +73,18 @@ def score_and_rank(
     messages: list[DiscordMessage], top_n: int = 1000
 ) -> list[ScoredMessage]:
     """Filter, score, and rank messages. Returns top N by score descending."""
-    # Build set of message IDs that received replies
-    received_replies: set[int] = set()
-    for msg in messages:
-        if msg.reply_to_id is not None:
-            received_replies.add(msg.reply_to_id)
+    received_replies = {
+        msg.reply_to_id for msg in messages if msg.reply_to_id is not None
+    }
 
-    # Filter, score, sort
-    scored = [
-        calculate_score(msg, received_replies)
-        for msg in messages
-        if passes_all_filters(msg)
-    ]
-    return heapq.nlargest(top_n, scored, key=lambda m: m.score)
+    # Generator feeds heapq.nlargest so memory stays at O(top_n) rather than O(N)
+    # even for users with tens of thousands of messages.
+    return heapq.nlargest(
+        top_n,
+        (
+            calculate_score(msg, received_replies)
+            for msg in messages
+            if passes_all_filters(msg)
+        ),
+        key=lambda m: m.score,
+    )

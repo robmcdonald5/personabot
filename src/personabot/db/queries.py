@@ -36,8 +36,12 @@ def _row_to_scrape_job(row: aiosqlite.Row) -> "ScrapeJob":
 
 
 def _row_to_discord_message(row: aiosqlite.Row) -> DiscordMessage:
-    """Convert a database row to a DiscordMessage model."""
-    return DiscordMessage(
+    """Convert a database row to a DiscordMessage model.
+
+    Uses model_construct to skip re-validation — DB data is trusted (it was
+    validated on insert). Hot path for exports that fetch 10k+ messages.
+    """
+    return DiscordMessage.model_construct(
         message_id=row["message_id"],
         guild_id=row["guild_id"],
         channel_id=row["channel_id"],
@@ -320,18 +324,16 @@ async def get_recent_scrape_jobs(
     limit: int = 25,
 ) -> list[ScrapeJob]:
     """Fetch recent scrape jobs for a guild, optionally filtered by status."""
+    clauses = ["guild_id = ?"]
+    params: list = [guild_id]
     if status_filter is not None:
-        query = (
-            "SELECT * FROM scrape_jobs WHERE guild_id = ? AND status = ? "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
-        params: tuple = (guild_id, status_filter, limit)
-    else:
-        query = (
-            "SELECT * FROM scrape_jobs WHERE guild_id = ? "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
-        params = (guild_id, limit)
+        clauses.append("status = ?")
+        params.append(status_filter)
+    query = (
+        f"SELECT * FROM scrape_jobs WHERE {' AND '.join(clauses)} "
+        "ORDER BY created_at DESC LIMIT ?"
+    )
+    params.append(limit)
 
     async with db.execute(query, params) as cursor:
         rows = await cursor.fetchall()
