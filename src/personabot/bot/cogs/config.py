@@ -30,7 +30,7 @@ class ConfigCog(commands.Cog):
     @config.command(name="show", description="Display current server configuration")
     async def config_show(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None  # Guaranteed by guild_only
-        db = self.bot.db_manager.get_connection()
+        db = self.bot.db
 
         cfg = await queries.get_guild_config(db, interaction.guild.id)
         if cfg is None:
@@ -62,7 +62,7 @@ class ConfigCog(commands.Cog):
         assert guild is not None  # Guaranteed by guild_only
 
         async def save_channels(channel_ids: list[int]) -> None:
-            db = self.bot.db_manager.get_connection()
+            db = self.bot.db
             await queries.upsert_guild_config(
                 db,
                 guild_id=guild.id,
@@ -88,7 +88,7 @@ class ConfigCog(commands.Cog):
         assert guild is not None  # Guaranteed by guild_only
 
         async def save_users(user_ids: list[int]) -> None:
-            db = self.bot.db_manager.get_connection()
+            db = self.bot.db
             await queries.upsert_guild_config(
                 db,
                 guild_id=guild.id,
@@ -120,7 +120,7 @@ class ConfigCog(commands.Cog):
             )
             return
 
-        db = self.bot.db_manager.get_connection()
+        db = self.bot.db
         await queries.upsert_guild_config(
             db,
             guild_id=guild.id,
