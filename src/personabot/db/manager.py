@@ -22,6 +22,10 @@ class DatabaseManager:
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA foreign_keys = ON")
+        # Wait up to 5s for a locked write rather than failing immediately.
+        # Retention cleanup, scrape commits, and interactive writes share one
+        # aiosqlite connection; without this, brief write races raise SQLITE_BUSY.
+        await db.execute("PRAGMA busy_timeout = 5000")
         await create_tables(db)
         self.db = db
         return db
