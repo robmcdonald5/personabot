@@ -33,7 +33,7 @@ class StatsCog(commands.Cog):
         guild = interaction.guild
         assert guild is not None  # Guaranteed by guild_only
 
-        db = self.bot.db_manager.get_connection()
+        db = self.bot.db
         user_stats = await queries.get_user_stats(db, guild.id, user.id)
 
         if user_stats is None:
@@ -75,7 +75,7 @@ class StatsCog(commands.Cog):
         guild = interaction.guild
         assert guild is not None  # Guaranteed by guild_only
 
-        db = self.bot.db_manager.get_connection()
+        db = self.bot.db
         server_stats = await queries.get_server_stats(db, guild.id)
 
         embed = discord.Embed(
@@ -117,7 +117,7 @@ class StatsCog(commands.Cog):
         assert guild is not None  # Guaranteed by guild_only
 
         n = min(max(n, 1), 25)
-        db = self.bot.db_manager.get_connection()
+        db = self.bot.db
         top_users = await queries.get_top_users(db, guild.id, n)
 
         if not top_users:

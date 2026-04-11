@@ -22,9 +22,20 @@ class ScrapeCog(commands.Cog):
 
     def __init__(self, bot: PersonaBot) -> None:
         self.bot = bot
-        # Track running tasks to prevent garbage collection
+        # Task refs are held to prevent asyncio from garbage-collecting them
+        # mid-run. They're cancelled cooperatively via _cancel_events on
+        # cog_unload so a reload doesn't orphan an in-flight scrape.
         self._tasks: dict[str, asyncio.Task] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
+
+    async def cog_unload(self) -> None:
+        """Signal cancellation and drain in-flight scrapes on reload/shutdown."""
+        for event in self._cancel_events.values():
+            event.set()
+        if self._tasks:
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        self._tasks.clear()
+        self._cancel_events.clear()
 
     scrape = app_commands.Group(
         name="scrape",
@@ -50,9 +61,7 @@ class ScrapeCog(commands.Cog):
         guild = interaction.guild
         assert guild is not None  # Guaranteed by guild_only
 
-        db = self.bot.db_manager.get_connection()
-
-        # Fetch config once for channel, limit, and excluded users
+        db = self.bot.db
         cfg = await queries.get_guild_config(db, guild.id)
 
         # Determine channels to scrape
@@ -124,7 +133,7 @@ class ScrapeCog(commands.Cog):
         cancel_event: asyncio.Event,
     ) -> None:
         """Background scrape task. Limit is global across all channels."""
-        db = self.bot.db_manager.get_connection()
+        db = self.bot.db
         media_threshold = self.bot.settings.media_reaction_threshold
         total_found = 0
         total_stored = 0
@@ -179,15 +188,25 @@ class ScrapeCog(commands.Cog):
                     )
                     batch.append(dm)
 
-                    # Download media for messages meeting reaction threshold
+                    # Download media for messages meeting reaction threshold.
+                    # Images for a single message download concurrently; the
+                    # scrape loop still awaits completion so per-message
+                    # ordering and media-row commits stay consistent with the
+                    # message upsert batch below.
                     if dm.reaction_count >= media_threshold and message.attachments:
-                        for att in message.attachments:
-                            if att.content_type and att.content_type.startswith(
-                                "image/"
-                            ):
-                                await self._download_media(
-                                    db, message.id, guild.id, att
+                        images = [
+                            att
+                            for att in message.attachments
+                            if att.content_type
+                            and att.content_type.startswith("image/")
+                        ]
+                        if images:
+                            await asyncio.gather(
+                                *(
+                                    self._download_media(db, message.id, guild.id, att)
+                                    for att in images
                                 )
+                            )
 
                     # Batch upsert every 100 messages
                     if len(batch) >= 100:
@@ -307,9 +326,8 @@ class ScrapeCog(commands.Cog):
         if interaction.guild_id is None:
             return []
         try:
-            db = self.bot.db_manager.get_connection()
             jobs = await queries.get_recent_scrape_jobs(
-                db, interaction.guild_id, status_filter=status_filter
+                self.bot.db, interaction.guild_id, status_filter=status_filter
             )
         except Exception:
             logger.exception("Job autocomplete failed")
@@ -323,11 +341,6 @@ class ScrapeCog(commands.Cog):
             if current.lower() in j.job_id.lower()
         ][:25]
 
-    async def _status_autocomplete(
-        self, interaction: discord.Interaction, current: str
-    ) -> list[app_commands.Choice[str]]:
-        return await self._job_autocomplete(interaction, current)
-
     async def _cancel_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
@@ -337,11 +350,11 @@ class ScrapeCog(commands.Cog):
 
     @scrape.command(name="status", description="Check scrape job status")
     @app_commands.describe(job_id="Job ID to check")
-    @app_commands.autocomplete(job_id=_status_autocomplete)
+    @app_commands.autocomplete(job_id=_job_autocomplete)
     async def scrape_status(
         self, interaction: discord.Interaction, job_id: str
     ) -> None:
-        db = self.bot.db_manager.get_connection()
+        db = self.bot.db
         job = await queries.get_scrape_job(db, job_id)
 
         if job is None:

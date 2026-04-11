@@ -10,7 +10,6 @@ from discord import app_commands
 from discord.ext import commands
 
 from personabot.bot.client import PersonaBot
-from personabot.config import Settings
 from personabot.db import queries
 from personabot.pipeline.export import (
     build_user_corpus,
@@ -23,9 +22,20 @@ from personabot.pipeline.windowing import create_windows, inject_reply_context
 logger = logging.getLogger(__name__)
 
 
-def _export_path(settings: Settings, guild_id: int, user_id: int) -> Path:
-    """Canonical export file path for a user in a guild."""
-    return settings.exports_dir / str(guild_id) / str(user_id) / "corpus.jsonl"
+def _scan_exported_user_ids(guild_export_dir: Path) -> set[int]:
+    """Return the set of user_ids that have a corpus.jsonl under a guild dir."""
+    if not guild_export_dir.exists():
+        return set()
+    result: set[int] = set()
+    for user_dir in guild_export_dir.iterdir():
+        if not user_dir.is_dir():
+            continue
+        if (user_dir / "corpus.jsonl").exists():
+            try:
+                result.add(int(user_dir.name))
+            except ValueError:
+                continue
+    return result
 
 
 class ExportCog(commands.Cog):
@@ -60,8 +70,9 @@ class ExportCog(commands.Cog):
             f"Exporting corpus for {user.mention}...", ephemeral=True
         )
 
-        db = self.bot.db_manager.get_connection()
-        token_budget = budget or self.bot.settings.token_budget
+        db = self.bot.db
+        settings = self.bot.settings
+        token_budget = budget or settings.token_budget
 
         # 1. Fetch messages
         messages = await queries.get_user_messages(db, guild.id, user.id)
@@ -73,11 +84,10 @@ class ExportCog(commands.Cog):
             return
 
         # 2. Score and rank (CPU-intensive — run in thread)
-        settings = self.bot.settings
         scored = await asyncio.to_thread(
             score_and_rank, messages, settings.top_n_messages
         )
-        del messages  # Free ~50-60 MB for large message sets
+        del messages  # Drop full message cache after top-N selection
 
         if not scored:
             await interaction.followup.send(
@@ -117,7 +127,7 @@ class ExportCog(commands.Cog):
         export_file = await asyncio.to_thread(
             export_jsonl,
             corpus,
-            _export_path(self.bot.settings, guild.id, user.id),
+            settings.export_path(guild.id, user.id),
         )
 
         # 7. Build result embed
@@ -175,7 +185,7 @@ class ExportCog(commands.Cog):
         guild = interaction.guild
         assert guild is not None  # Guaranteed by guild_only
 
-        export_path = _export_path(self.bot.settings, guild.id, user.id)
+        export_path = self.bot.settings.export_path(guild.id, user.id)
         if not export_path.exists():
             await interaction.response.send_message(
                 f"No export found for {user.mention}. "
@@ -227,7 +237,7 @@ class ExportCog(commands.Cog):
         guild = interaction.guild
         assert guild is not None  # Guaranteed by guild_only
 
-        db = self.bot.db_manager.get_connection()
+        db = self.bot.db
         top_users = await queries.get_top_users(db, guild.id, 25)
 
         if not top_users:
@@ -236,10 +246,17 @@ class ExportCog(commands.Cog):
             )
             return
 
+        # Single directory scan beats N per-user Path.exists() calls on
+        # the event loop thread. Guild export dirs look like
+        # {exports_dir}/{guild_id}/{user_id}/corpus.jsonl.
+        guild_export_dir = self.bot.settings.exports_dir / str(guild.id)
+        exported_user_ids = await asyncio.to_thread(
+            _scan_exported_user_ids, guild_export_dir
+        )
+
         lines = []
         for u in top_users:
-            ep = _export_path(self.bot.settings, guild.id, u.author_id)
-            status = "exported" if ep.exists() else "not exported"
+            status = "exported" if u.author_id in exported_user_ids else "not exported"
             lines.append(f"**{u.author_name}** -- {u.message_count:,} msgs ({status})")
 
         embed = discord.Embed(
