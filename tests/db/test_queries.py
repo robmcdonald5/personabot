@@ -23,13 +23,13 @@ async def test_upsert_and_get_guild_config(db_connection):
         guild_id=100,
         guild_name="Test Server",
         scrape_channels=[1, 2, 3],
-        excluded_users=[99],
+        included_users=[99],
     )
     await db_connection.commit()
     assert config.guild_id == 100
     assert config.guild_name == "Test Server"
     assert config.scrape_channels == [1, 2, 3]
-    assert config.excluded_users == [99]
+    assert config.included_users == [99]
 
     fetched = await queries.get_guild_config(db_connection, 100)
     assert fetched is not None
@@ -61,26 +61,130 @@ async def test_guild_config_upsert_preserves_other_fields(db_connection):
         guild_id=100,
         guild_name="Test Server",
         scrape_channels=[1, 2, 3],
-        excluded_users=[99],
+        included_users=[99],
         default_limit=5000,
     )
     await db_connection.commit()
-    # Update only excluded_users — channels and limit should survive
+    # Update only included_users — channels and limit should survive
     updated = await queries.upsert_guild_config(
         db_connection,
         guild_id=100,
         guild_name="Test Server",
-        excluded_users=[88, 77],
+        included_users=[88, 77],
     )
     await db_connection.commit()
     assert updated.scrape_channels == [1, 2, 3]
-    assert updated.excluded_users == [88, 77]
+    assert updated.included_users == [88, 77]
     assert updated.default_limit == 5000
 
 
 async def test_get_guild_config_missing(db_connection):
     result = await queries.get_guild_config(db_connection, 999)
     assert result is None
+
+
+# --- Included users + scrape window ---
+
+
+async def test_upsert_guild_config_included_users(db_connection):
+    """Included users field round-trips via upsert and get."""
+    cfg = await queries.upsert_guild_config(
+        db_connection,
+        guild_id=100,
+        guild_name="Test Server",
+        included_users=[1, 2, 3],
+    )
+    await db_connection.commit()
+    assert cfg.included_users == [1, 2, 3]
+
+    fetched = await queries.get_guild_config(db_connection, 100)
+    assert fetched is not None
+    assert fetched.included_users == [1, 2, 3]
+
+
+async def test_upsert_guild_config_window_dates(db_connection):
+    """Scrape start/end dates round-trip as YYYY-MM-DD strings."""
+    cfg = await queries.upsert_guild_config(
+        db_connection,
+        guild_id=100,
+        guild_name="Test Server",
+        scrape_start_date="2024-01-15",
+        scrape_end_date="2024-06-30",
+    )
+    await db_connection.commit()
+    assert cfg.scrape_start_date == "2024-01-15"
+    assert cfg.scrape_end_date == "2024-06-30"
+
+    fetched = await queries.get_guild_config(db_connection, 100)
+    assert fetched is not None
+    assert fetched.scrape_start_date == "2024-01-15"
+    assert fetched.scrape_end_date == "2024-06-30"
+
+
+async def test_upsert_guild_config_preserves_new_fields(db_connection):
+    """Partial updates must not wipe other merge-preserved fields."""
+    await queries.upsert_guild_config(
+        db_connection,
+        guild_id=100,
+        guild_name="Test Server",
+        included_users=[10, 20],
+        scrape_start_date="2024-01-15",
+        scrape_end_date="2024-06-30",
+    )
+    await db_connection.commit()
+    # Update an unrelated field — v2 fields should survive
+    updated = await queries.upsert_guild_config(
+        db_connection,
+        guild_id=100,
+        guild_name="Test Server",
+        scrape_channels=[5, 6],
+    )
+    await db_connection.commit()
+    assert updated.included_users == [10, 20]
+    assert updated.scrape_start_date == "2024-01-15"
+    assert updated.scrape_end_date == "2024-06-30"
+    assert updated.scrape_channels == [5, 6]
+
+
+async def test_reset_guild_config(db_connection):
+    """Reset clears all user-configurable fields but keeps the row."""
+    await queries.upsert_guild_config(
+        db_connection,
+        guild_id=100,
+        guild_name="Test Server",
+        scrape_channels=[1, 2],
+        included_users=[42],
+        scrape_start_date="2024-01-15",
+        scrape_end_date="2024-06-30",
+        default_limit=5000,
+    )
+    await db_connection.commit()
+    original = await queries.get_guild_config(db_connection, 100)
+    assert original is not None
+    original_created = original.created_at
+
+    ok = await queries.reset_guild_config(db_connection, 100)
+    await db_connection.commit()
+    assert ok is True
+
+    after = await queries.get_guild_config(db_connection, 100)
+    assert after is not None
+    assert after.guild_id == 100
+    assert after.guild_name == "Test Server"
+    assert after.scrape_channels == []
+    assert after.included_users == []
+    assert after.scrape_start_date is None
+    assert after.scrape_end_date is None
+    assert after.default_limit == 10000
+    # Row identity preserved
+    assert after.created_at == original_created
+
+
+async def test_reset_guild_config_missing_row(db_connection):
+    """Resetting a guild with no config row returns False."""
+    ok = await queries.reset_guild_config(db_connection, 999)
+    await db_connection.commit()
+    assert ok is False
 
 
 # --- Scrape jobs ---
@@ -134,6 +238,21 @@ async def test_get_active_scrape_jobs(db_connection):
     active = await queries.get_active_scrape_jobs(db_connection, 100)
     assert len(active) == 1
     assert active[0].job_id == "job-1"
+
+
+async def test_count_scrape_jobs(db_connection):
+    """Count reflects all jobs regardless of status."""
+    await queries.upsert_guild_config(db_connection, 100, "Test Server")
+    assert await queries.count_scrape_jobs(db_connection, 100) == 0
+
+    await queries.create_scrape_job(db_connection, "job-1", 100)
+    await queries.create_scrape_job(db_connection, "job-2", 100)
+    await queries.update_scrape_job_status(db_connection, "job-2", JobStatus.COMPLETED)
+    await db_connection.commit()
+
+    assert await queries.count_scrape_jobs(db_connection, 100) == 2
+    # Different guild with no jobs still returns 0
+    assert await queries.count_scrape_jobs(db_connection, 999) == 0
 
 
 # --- Messages ---
