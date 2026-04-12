@@ -341,6 +341,14 @@ class ScrapeCog(commands.Cog):
             if current.lower() in j.job_id.lower()
         ][:25]
 
+    # discord.py validates autocomplete callbacks have exactly 2–3 params
+    # (self, interaction, current). _job_autocomplete has a 4th param
+    # (status_filter), so these thin wrappers are required — not dead code.
+    async def _status_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._job_autocomplete(interaction, current)
+
     async def _cancel_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
@@ -350,7 +358,7 @@ class ScrapeCog(commands.Cog):
 
     @scrape.command(name="status", description="Check scrape job status")
     @app_commands.describe(job_id="Job ID to check")
-    @app_commands.autocomplete(job_id=_job_autocomplete)
+    @app_commands.autocomplete(job_id=_status_autocomplete)
     async def scrape_status(
         self, interaction: discord.Interaction, job_id: str
     ) -> None:
