@@ -74,13 +74,24 @@ class ExportCog(commands.Cog):
         settings = self.bot.settings
         token_budget = budget or settings.token_budget
 
-        # 1. Fetch messages
+        # 1. Fetch messages — distinguish "guild has never scraped" from
+        # "this specific user wasn't in the scraped data" for clearer UX.
         messages = await queries.get_user_messages(db, guild.id, user.id)
         if not messages:
-            await interaction.followup.send(
-                f"No messages found for {user.mention}. Run a scrape first.",
-                ephemeral=True,
-            )
+            job_count = await queries.count_scrape_jobs(db, guild.id)
+            if job_count == 0:
+                await interaction.followup.send(
+                    "No scrapes have been run for this server yet. "
+                    "Run `/pb scrape start` first.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"No messages found for {user.mention}. They weren't in "
+                    "the scraped data — try `/pb scrape start` targeting that "
+                    "user, or adjust the scrape window and channels.",
+                    ephemeral=True,
+                )
             return
 
         # 2. Score and rank (CPU-intensive — run in thread)
