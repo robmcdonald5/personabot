@@ -111,7 +111,7 @@ Run the full preprocessing pipeline and export a user's corpus as JSONL.
   6. Inject reply context (parent message content for replies)
   7. Enforce token budget (include whole windows in quality order until budget is full)
   8. Write JSONL file and send as Discord attachment
-- **Delivery:** JSONL file sent as a Discord file attachment (up to 25 MB). Files exceeding 25 MB fall back to disk path. Embed footer warns about the retention window.
+- **Delivery:** JSONL file sent as a Discord file attachment (up to 25 MB). Files exceeding 25 MB are not attached — the embed shows a warning suggesting you reduce the token budget. Embed footer warns about the retention window.
 - **JSONL format:** Line 1 is corpus metadata (user, guild, date range, counts). Lines 2+ are one conversation window per line.
 
 ### `/pb export view`
