@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -14,6 +15,20 @@ from personabot.db import queries
 from personabot.db.manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
+
+# Cog extension module paths. The group name embedded in each cog's
+# app_commands.Group must match the last path component; setup_hook uses
+# this to re-parent cog groups under /pb after load_extension registers
+# them at top level. Cross-cog parent sharing is explicitly not supported
+# by discord.py (Rapptz #8069) — this tree manipulation is the only
+# approach that works without collapsing into a single GroupCog.
+_COG_EXTENSIONS: tuple[str, ...] = (
+    "personabot.bot.cogs.config",
+    "personabot.bot.cogs.scrape",
+    "personabot.bot.cogs.export",
+    "personabot.bot.cogs.stats",
+)
+_COG_GROUP_NAMES: tuple[str, ...] = ("config", "scrape", "export", "stats")
 
 
 class PersonaBot(commands.Bot):
@@ -36,49 +51,68 @@ class PersonaBot(commands.Bot):
         self.db_manager = db_manager
         self.settings = settings
 
-        # Shared top-level command group — all cogs attach subgroups to this
-        # guild_only=True prevents DM usage for all subcommands
-        # Shared top-level command group — cogs attach subgroups in their setup()
+        # Shared /pb parent group. Cog subgroups are re-parented under this
+        # in setup_hook since discord.py forbids cross-cog parent references.
         self.pb = app_commands.Group(
             name="pb", description="PersonaBot commands", guild_only=True
         )
+
+    @property
+    def db(self) -> aiosqlite.Connection:
+        """Shortcut for the shared aiosqlite connection."""
+        return self.db_manager.get_connection()
 
     async def setup_hook(self) -> None:
         """Called before the bot connects. Load DB and cogs."""
         await self.db_manager.connect()
         logger.info("Database connected.")
 
-        cog_extensions = [
-            "personabot.bot.cogs.config",
-            "personabot.bot.cogs.scrape",
-            "personabot.bot.cogs.export",
-            "personabot.bot.cogs.stats",
-        ]
-        for ext in cog_extensions:
+        for ext in _COG_EXTENSIONS:
             await self.load_extension(ext)
             logger.info("Loaded extension: %s", ext)
 
-        # Move cog command groups under the /pb parent.
-        # add_cog registers each group as top-level; we relocate them.
-        for name in ("config", "scrape", "export", "stats"):
+        for name in _COG_GROUP_NAMES:
             cmd = self.tree.remove_command(name)
             if cmd is not None:
                 self.pb.add_command(cmd)
         self.tree.add_command(self.pb)
 
-        # Start the retention cleanup loop
         self.retention_cleanup.start()
 
-        # Dev mode: sync to one guild for instant updates
-        # Production: sync globally (takes up to 1 hour to propagate)
+        await self._sync_command_tree()
+
+    async def _sync_command_tree(self) -> None:
+        """Sync the app command tree to Discord.
+
+        Dev mode (DEV_GUILD_ID set): always syncs to the dev guild — guild
+        syncs are instant and not rate-limited.
+
+        Production (no DEV_GUILD_ID): only syncs globally if
+        auto_sync_commands is True. Global syncs are rate-limited and
+        should be triggered manually when commands change, not on every
+        restart. See AbstractUmbra's app command guide for rationale.
+        """
         if self.settings.dev_guild_id:
             guild = discord.Object(id=self.settings.dev_guild_id)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
             logger.info("Commands synced to dev guild %s", self.settings.dev_guild_id)
-        else:
-            await self.tree.sync()
-            logger.info("Commands synced globally")
+            return
+
+        if not self.settings.auto_sync_commands:
+            logger.info(
+                "Skipping global command sync (auto_sync_commands=False). "
+                "Run a manual sync when command definitions change."
+            )
+            return
+
+        logger.warning(
+            "Global command sync running on startup. Global syncs are "
+            "rate-limited; set auto_sync_commands=False and trigger manually "
+            "when commands change."
+        )
+        await self.tree.sync()
+        logger.info("Commands synced globally")
 
     async def close(self) -> None:
         """Clean shutdown."""
@@ -99,7 +133,7 @@ class PersonaBot(commands.Bot):
     async def retention_cleanup(self) -> None:
         """Purge scraped data older than retention_hours."""
         try:
-            db = self.db_manager.get_connection()
+            db = self.db
             cutoff_dt = datetime.now(timezone.utc) - timedelta(
                 hours=self.settings.retention_hours
             )
@@ -169,4 +203,8 @@ class PersonaBot(commands.Bot):
 
     @retention_cleanup.before_loop
     async def before_retention_cleanup(self) -> None:
+        # tasks.loop(hours=1) waits an hour before its first iteration,
+        # so on bot restarts more frequent than an hour no cleanup would
+        # ever run. wait_until_ready() gates on the gateway connection;
+        # the first tick then happens immediately.
         await self.wait_until_ready()

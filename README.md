@@ -26,9 +26,11 @@ All commands live under the `/pb` namespace:
 |---------|-------------|
 | `/pb config show` | Display current server configuration |
 | `/pb config set-channels` | Set channels to scrape |
-| `/pb config set-excluded-users` | Set users to exclude |
+| `/pb config set-included-users` | Set the required user allowlist (empty = scrapes blocked) |
+| `/pb config set-window` | Set the default scrape date window (modal) |
 | `/pb config set-message-limit` | Set default scrape limit |
-| `/pb scrape start [user] [channel] [limit]` | Start a message scrape job |
+| `/pb config reset` | Reset all config fields to defaults |
+| `/pb scrape start [user] [channel] [limit]` | Start a message scrape job (opens date-window modal) |
 | `/pb scrape status <job_id>` | Check scrape job progress |
 | `/pb scrape cancel <job_id>` | Cancel a running scrape |
 | `/pb export generate <user> [budget]` | Export a user's corpus as JSONL |
@@ -37,6 +39,8 @@ All commands live under the `/pb` namespace:
 | `/pb stats user <user>` | User message stats |
 | `/pb stats server` | Server-wide stats |
 | `/pb stats top [n]` | Top users by message count |
+
+See `docs/commands.md` for the authoritative reference including parameters, permissions, and response details.
 
 ## Architecture
 

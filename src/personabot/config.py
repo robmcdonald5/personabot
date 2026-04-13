@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     # Discord
     discord_token: str
     dev_guild_id: int | None = None  # Set for instant command sync during development
+    # Whether to auto-sync the command tree on startup. Guild sync (dev mode)
+    # is cheap and runs regardless; global sync (production) is rate-limited
+    # and discouraged for every restart — opt out and use a manual owner sync.
+    auto_sync_commands: bool = True
 
     # Storage — all paths derived from data_dir
     data_dir: Path = Path("data")
@@ -34,6 +38,10 @@ class Settings(BaseSettings):
     @property
     def exports_dir(self) -> Path:
         return self.data_dir / "exports"
+
+    def export_path(self, guild_id: int, user_id: int) -> Path:
+        """Canonical export JSONL path for a user in a guild."""
+        return self.exports_dir / str(guild_id) / str(user_id) / "corpus.jsonl"
 
     # Scraping defaults
     default_limit: int = 10000

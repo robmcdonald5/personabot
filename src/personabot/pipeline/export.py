@@ -6,6 +6,8 @@ from pathlib import Path
 
 from personabot.schemas.corpus import ConversationWindow, DateRange, UserCorpus
 
+_WINDOW_METADATA_OVERHEAD = 50
+
 
 def estimate_tokens(text: str) -> int:
     """Rough token estimate: ~4 characters per token."""
@@ -14,10 +16,8 @@ def estimate_tokens(text: str) -> int:
 
 def _window_token_cost(window: ConversationWindow) -> int:
     """Estimate the token cost of a single window."""
-    char_count = sum(len(m.content) for m in window.messages)
-    char_count += max(len(window.messages) - 1, 0)  # Spaces between messages
-    metadata_overhead = 50
-    return char_count // 4 + metadata_overhead
+    joined = " ".join(m.content for m in window.messages)
+    return estimate_tokens(joined) + _WINDOW_METADATA_OVERHEAD
 
 
 def enforce_token_budget(

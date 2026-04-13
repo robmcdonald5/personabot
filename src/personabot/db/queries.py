@@ -36,8 +36,12 @@ def _row_to_scrape_job(row: aiosqlite.Row) -> "ScrapeJob":
 
 
 def _row_to_discord_message(row: aiosqlite.Row) -> DiscordMessage:
-    """Convert a database row to a DiscordMessage model."""
-    return DiscordMessage(
+    """Convert a database row to a DiscordMessage model.
+
+    Uses model_construct to skip re-validation — DB data is trusted (it was
+    validated on insert). Hot path for exports that fetch 10k+ messages.
+    """
+    return DiscordMessage.model_construct(
         message_id=row["message_id"],
         guild_id=row["guild_id"],
         channel_id=row["channel_id"],
@@ -104,7 +108,9 @@ class GuildConfig(BaseModel):
     guild_id: int
     guild_name: str
     scrape_channels: list[int] = Field(default_factory=list)
-    excluded_users: list[int] = Field(default_factory=list)
+    included_users: list[int] = Field(default_factory=list)
+    scrape_start_date: str | None = None  # YYYY-MM-DD (UTC)
+    scrape_end_date: str | None = None  # YYYY-MM-DD (UTC)
     default_limit: int = 10000
     created_at: str = ""
     updated_at: str = ""
@@ -171,30 +177,43 @@ async def upsert_guild_config(
     guild_id: int,
     guild_name: str,
     scrape_channels: list[int] | None = None,
-    excluded_users: list[int] | None = None,
+    included_users: list[int] | None = None,
+    scrape_start_date: str | None = None,
+    scrape_end_date: str | None = None,
     default_limit: int | None = None,
 ) -> GuildConfig:
     """Insert or update guild configuration.
 
     None values mean "keep existing" — only non-None fields are updated.
-    For new guilds, None falls back to schema defaults ([] and 10000).
+    For new guilds, None falls back to schema defaults ([]/NULL/10000).
+    To explicitly clear fields to defaults, call `reset_guild_config`.
     Caller is responsible for committing.
     """
     now = utc_now_sqlite()
     existing = await get_guild_config(db, guild_id)
 
-    # Merge: provided value wins, else keep existing, else schema default
-    channels_json = json.dumps(
+    # Merge: provided value wins, else keep existing, else schema default.
+    resolved_channels: list[int] = (
         scrape_channels
         if scrape_channels is not None
         else (existing.scrape_channels if existing else [])
     )
-    excluded_json = json.dumps(
-        excluded_users
-        if excluded_users is not None
-        else (existing.excluded_users if existing else [])
+    resolved_included: list[int] = (
+        included_users
+        if included_users is not None
+        else (existing.included_users if existing else [])
     )
-    limit = (
+    resolved_start = (
+        scrape_start_date
+        if scrape_start_date is not None
+        else (existing.scrape_start_date if existing else None)
+    )
+    resolved_end = (
+        scrape_end_date
+        if scrape_end_date is not None
+        else (existing.scrape_end_date if existing else None)
+    )
+    resolved_limit = (
         default_limit
         if default_limit is not None
         else (existing.default_limit if existing else 10000)
@@ -203,18 +222,44 @@ async def upsert_guild_config(
     await db.execute(
         """
         INSERT INTO guild_config (guild_id, guild_name, scrape_channels,
-                                  excluded_users, default_limit, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+                                  included_users, scrape_start_date,
+                                  scrape_end_date, default_limit,
+                                  created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(guild_id) DO UPDATE SET
             guild_name = excluded.guild_name,
             scrape_channels = excluded.scrape_channels,
-            excluded_users = excluded.excluded_users,
+            included_users = excluded.included_users,
+            scrape_start_date = excluded.scrape_start_date,
+            scrape_end_date = excluded.scrape_end_date,
             default_limit = excluded.default_limit,
             updated_at = excluded.updated_at
         """,
-        (guild_id, guild_name, channels_json, excluded_json, limit, now, now),
+        (
+            guild_id,
+            guild_name,
+            json.dumps(resolved_channels),
+            json.dumps(resolved_included),
+            resolved_start,
+            resolved_end,
+            resolved_limit,
+            now,
+            now,
+        ),
     )
-    return await get_guild_config(db, guild_id)  # type: ignore[return-value]
+    # Construct the return locally from merged values rather than re-SELECTing.
+    # created_at is preserved on update; for fresh inserts it defaults to `now`.
+    return GuildConfig(
+        guild_id=guild_id,
+        guild_name=guild_name,
+        scrape_channels=resolved_channels,
+        included_users=resolved_included,
+        scrape_start_date=resolved_start,
+        scrape_end_date=resolved_end,
+        default_limit=resolved_limit,
+        created_at=existing.created_at if existing else now,
+        updated_at=now,
+    )
 
 
 async def get_guild_config(
@@ -231,11 +276,37 @@ async def get_guild_config(
             guild_id=row["guild_id"],
             guild_name=row["guild_name"],
             scrape_channels=json.loads(row["scrape_channels"]),
-            excluded_users=json.loads(row["excluded_users"]),
+            included_users=json.loads(row["included_users"]),
+            scrape_start_date=row["scrape_start_date"],
+            scrape_end_date=row["scrape_end_date"],
             default_limit=row["default_limit"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+
+async def reset_guild_config(db: aiosqlite.Connection, guild_id: int) -> bool:
+    """Clear all user-configurable fields on a guild config row.
+
+    Wipes channels, included users, scrape window dates, and the message
+    limit back to defaults. Preserves `guild_id`, `guild_name`, and
+    `created_at` so the row retains its identity and audit timestamp.
+    Returns True if a row was updated. Caller is responsible for committing.
+    """
+    cursor = await db.execute(
+        """
+        UPDATE guild_config
+        SET scrape_channels   = '[]',
+            included_users    = '[]',
+            scrape_start_date = NULL,
+            scrape_end_date   = NULL,
+            default_limit     = 10000,
+            updated_at        = ?
+        WHERE guild_id = ?
+        """,
+        (utc_now_sqlite(), guild_id),
+    )
+    return cursor.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +384,19 @@ async def get_active_scrape_jobs(
         return [_row_to_scrape_job(row) for row in rows]
 
 
+async def count_scrape_jobs(db: aiosqlite.Connection, guild_id: int) -> int:
+    """Return how many scrape jobs have ever been created for a guild.
+
+    Used by /pb export to distinguish "this guild has never scraped" from
+    "this user wasn't in the scraped data" when producing empty-result errors.
+    """
+    async with db.execute(
+        "SELECT COUNT(*) FROM scrape_jobs WHERE guild_id = ?", (guild_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+
 async def get_recent_scrape_jobs(
     db: aiosqlite.Connection,
     guild_id: int,
@@ -320,18 +404,16 @@ async def get_recent_scrape_jobs(
     limit: int = 25,
 ) -> list[ScrapeJob]:
     """Fetch recent scrape jobs for a guild, optionally filtered by status."""
+    clauses = ["guild_id = ?"]
+    params: list = [guild_id]
     if status_filter is not None:
-        query = (
-            "SELECT * FROM scrape_jobs WHERE guild_id = ? AND status = ? "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
-        params: tuple = (guild_id, status_filter, limit)
-    else:
-        query = (
-            "SELECT * FROM scrape_jobs WHERE guild_id = ? "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
-        params = (guild_id, limit)
+        clauses.append("status = ?")
+        params.append(status_filter)
+    query = (
+        f"SELECT * FROM scrape_jobs WHERE {' AND '.join(clauses)} "
+        "ORDER BY created_at DESC LIMIT ?"
+    )
+    params.append(limit)
 
     async with db.execute(query, params) as cursor:
         rows = await cursor.fetchall()
