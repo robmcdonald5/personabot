@@ -62,20 +62,22 @@ class ScrapeCog(commands.Cog):
 
     def __init__(self, bot: PersonaBot) -> None:
         self.bot = bot
-        # Task refs are held to prevent asyncio from garbage-collecting them
-        # mid-run. They're cancelled cooperatively via _cancel_events on
-        # cog_unload so a reload doesn't orphan an in-flight scrape.
-        self._tasks: dict[str, asyncio.Task] = {}
-        self._cancel_events: dict[str, asyncio.Event] = {}
+        # job_id -> (task, cancel_event). The task ref keeps asyncio from
+        # GC'ing the in-flight scrape; the event lets cog_unload (and
+        # /pb scrape cancel) signal cooperative cancellation. Single dict
+        # keeps the two refs from drifting out of sync.
+        self._jobs: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
 
     async def cog_unload(self) -> None:
         """Signal cancellation and drain in-flight scrapes on reload/shutdown."""
-        for event in self._cancel_events.values():
+        for _, event in self._jobs.values():
             event.set()
-        if self._tasks:
-            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
-        self._tasks.clear()
-        self._cancel_events.clear()
+        if self._jobs:
+            await asyncio.gather(
+                *(task for task, _ in self._jobs.values()),
+                return_exceptions=True,
+            )
+        self._jobs.clear()
 
     scrape = app_commands.Group(
         name="scrape",
@@ -164,7 +166,6 @@ class ScrapeCog(commands.Cog):
         )
 
         cancel_event = asyncio.Event()
-        self._cancel_events[job_id] = cancel_event
         task = asyncio.create_task(
             self._run_scrape(
                 job_id=job_id,
@@ -178,7 +179,7 @@ class ScrapeCog(commands.Cog):
                 cancel_event=cancel_event,
             )
         )
-        self._tasks[job_id] = task
+        self._jobs[job_id] = (task, cancel_event)
 
     async def _run_scrape(
         self,
@@ -354,8 +355,7 @@ class ScrapeCog(commands.Cog):
                     pass
 
         finally:
-            self._tasks.pop(job_id, None)
-            self._cancel_events.pop(job_id, None)
+            self._jobs.pop(job_id, None)
 
     async def _download_media(
         self,
@@ -396,7 +396,7 @@ class ScrapeCog(commands.Cog):
             logger.warning("Failed to save media record for %s: %s", attachment.url, e)
 
     # discord.py's autocomplete callbacks must have exactly 2-3 params,
-    # so these are thin wrappers around the shared helper in autocomplete.py.
+    # so these are thin wrappers around fetch_job_choices above.
     async def _status_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
@@ -450,13 +450,14 @@ class ScrapeCog(commands.Cog):
     async def scrape_cancel(
         self, interaction: discord.Interaction, job_id: str
     ) -> None:
-        cancel_event = self._cancel_events.get(job_id)
-        if cancel_event is None:
+        entry = self._jobs.get(job_id)
+        if entry is None:
             await interaction.response.send_message(
                 f"Job `{job_id}` is not running.", ephemeral=True
             )
             return
 
+        _, cancel_event = entry
         cancel_event.set()
         await interaction.response.send_message(
             f"Cancellation requested for job `{job_id}`.", ephemeral=True
