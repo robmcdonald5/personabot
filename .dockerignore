@@ -1,0 +1,61 @@
+# Everything unnecessary for the runtime image. Keeps the build
+# context under ~2 MB so `docker compose build` is fast even on a
+# slow uplink.
+
+# Virtualenvs — rebuilt inside the builder stage
+.venv/
+venv/
+env/
+
+# Python bytecode + wheels + packaging crud
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Tests + test infra — not shipped to prod
+tests/
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Local dev data (media files, export JSONLs, etc)
+data/
+
+# Source control
+.git/
+.gitignore
+.github/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Docs (the bot doesn't read them at runtime; they live in the repo only)
+docs/
+*.md
+
+# Environment files — Compose injects .env.prod via env_file: directive,
+# not by copying into the image. Keeping these out prevents secrets
+# from leaking into a layer.
+.env
+.env.*
+!.env.*.example
+
+# Deployment infra
+.hetzner/
+
+# Claude
+.claude/

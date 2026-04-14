@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: personabot_pg_dev
+    environment:
+      POSTGRES_USER: personabot
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: personabot
+    ports:
+      # 5433 on host to avoid collision with any system Postgres on 5432.
+      - "5433:5432"
+    volumes:
+      # Named volume lives inside Docker Desktop's WSL2 ext4 backend
+      # (not a bind mount onto NTFS) so Postgres fsync is fast and
+      # crash-safe. Volume is ephemeral in dev — wiped on docker compose down -v.
+      - pgdata_dev:/var/lib/postgresql/data
+    command: >
+      postgres
+        -c fsync=off
+        -c synchronous_commit=off
+        -c full_page_writes=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U personabot -d personabot"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata_dev:
