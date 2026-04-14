@@ -7,7 +7,7 @@ manage commit boundaries.
 
 Placeholder style is Postgres ``$N`` positional. JSONB columns
 (``scrape_channels``, ``included_users``, ``channels``) use the asyncpg
-JSONB codec registered in ``db/manager._register_codecs`` so Python
+JSONB codec registered in ``db/manager.register_codecs`` so Python
 ``list[int]`` round-trips natively without json.dumps/loads.
 """
 
@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from personabot.schemas.discord import TERMINAL_STATUSES, DiscordMessage, JobStatus
 
@@ -33,6 +33,21 @@ def _rowcount(status: str) -> int:
     the legacy OID field), so the last token is still the count.
     """
     return int(status.split()[-1])
+
+
+def _row_to_guild_config(row: asyncpg.Record) -> "GuildConfig":
+    """Convert a database row to a GuildConfig model."""
+    return GuildConfig(
+        guild_id=row["guild_id"],
+        guild_name=row["guild_name"],
+        scrape_channels=row["scrape_channels"],
+        included_users=row["included_users"],
+        scrape_start_date=row["scrape_start_date"],
+        scrape_end_date=row["scrape_end_date"],
+        default_limit=row["default_limit"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
 
 
 def _row_to_scrape_job(row: asyncpg.Record) -> "ScrapeJob":
@@ -136,30 +151,30 @@ def _message_to_params(msg: DiscordMessage, *, job_id: str | None) -> tuple[Any,
 
 
 class GuildConfig(BaseModel):
-    """Guild configuration row."""
+    """Guild configuration row. Always hydrated from a DB row, never partial."""
 
     guild_id: int
     guild_name: str
-    scrape_channels: list[int] = Field(default_factory=list)
-    included_users: list[int] = Field(default_factory=list)
-    scrape_start_date: str | None = None  # YYYY-MM-DD (UTC)
-    scrape_end_date: str | None = None  # YYYY-MM-DD (UTC)
-    default_limit: int = 10000
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
+    scrape_channels: list[int]
+    included_users: list[int]
+    scrape_start_date: str | None  # YYYY-MM-DD (UTC)
+    scrape_end_date: str | None  # YYYY-MM-DD (UTC)
+    default_limit: int
+    created_at: datetime
+    updated_at: datetime
 
 
 class ScrapeJob(BaseModel):
-    """Scrape job row."""
+    """Scrape job row. Always hydrated from a DB row, never partial."""
 
     job_id: str
     guild_id: int
-    status: JobStatus = JobStatus.PENDING
-    channels: list[int] = Field(default_factory=list)
-    messages_found: int = 0
-    messages_stored: int = 0
-    completed_at: datetime | None = None
-    error_message: str | None = None
+    status: JobStatus
+    channels: list[int]
+    messages_found: int
+    messages_stored: int
+    completed_at: datetime | None
+    error_message: str | None
 
 
 class UserStats(BaseModel):
@@ -201,79 +216,48 @@ async def upsert_guild_config(
 ) -> GuildConfig:
     """Insert or update guild configuration.
 
-    None values mean "keep existing" — only non-None fields are updated.
-    For new guilds, None falls back to schema defaults ([]/NULL/10000).
-    To explicitly clear fields to defaults, call `reset_guild_config`.
+    None values mean "keep existing" — the merge is pushed into SQL via
+    ``COALESCE`` so this is a single round trip with no read-before-write.
+    For new guilds, ``None`` falls back to schema defaults ([] / NULL /
+    10000). To explicitly clear fields, call ``reset_guild_config``.
     Caller is responsible for wrapping writes in ``db.transaction()``.
     """
-    now = datetime.now(timezone.utc)
-    existing = await get_guild_config(db, guild_id)
-
-    # Merge: provided value wins, else keep existing, else schema default.
-    resolved_channels: list[int] = (
-        scrape_channels
-        if scrape_channels is not None
-        else (existing.scrape_channels if existing else [])
-    )
-    resolved_included: list[int] = (
-        included_users
-        if included_users is not None
-        else (existing.included_users if existing else [])
-    )
-    resolved_start = (
-        scrape_start_date
-        if scrape_start_date is not None
-        else (existing.scrape_start_date if existing else None)
-    )
-    resolved_end = (
-        scrape_end_date
-        if scrape_end_date is not None
-        else (existing.scrape_end_date if existing else None)
-    )
-    resolved_limit = (
-        default_limit
-        if default_limit is not None
-        else (existing.default_limit if existing else 10000)
-    )
-
-    await db.execute(
+    row = await db.fetchrow(
         """
-        INSERT INTO guild_config (guild_id, guild_name, scrape_channels,
-                                  included_users, scrape_start_date,
-                                  scrape_end_date, default_limit,
-                                  created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+        INSERT INTO guild_config (
+            guild_id, guild_name, scrape_channels, included_users,
+            scrape_start_date, scrape_end_date, default_limit,
+            created_at, updated_at
+        )
+        VALUES (
+            $1, $2,
+            COALESCE($3::jsonb, '[]'::jsonb),
+            COALESCE($4::jsonb, '[]'::jsonb),
+            $5, $6,
+            COALESCE($7, 10000),
+            $8, $8
+        )
         ON CONFLICT (guild_id) DO UPDATE SET
             guild_name        = EXCLUDED.guild_name,
-            scrape_channels   = EXCLUDED.scrape_channels,
-            included_users    = EXCLUDED.included_users,
-            scrape_start_date = EXCLUDED.scrape_start_date,
-            scrape_end_date   = EXCLUDED.scrape_end_date,
-            default_limit     = EXCLUDED.default_limit,
+            scrape_channels   = COALESCE($3::jsonb, guild_config.scrape_channels),
+            included_users    = COALESCE($4::jsonb, guild_config.included_users),
+            scrape_start_date = COALESCE($5, guild_config.scrape_start_date),
+            scrape_end_date   = COALESCE($6, guild_config.scrape_end_date),
+            default_limit     = COALESCE($7, guild_config.default_limit),
             updated_at        = EXCLUDED.updated_at
+        RETURNING *
         """,
         guild_id,
         guild_name,
-        resolved_channels,
-        resolved_included,
-        resolved_start,
-        resolved_end,
-        resolved_limit,
-        now,
+        scrape_channels,
+        included_users,
+        scrape_start_date,
+        scrape_end_date,
+        default_limit,
+        datetime.now(timezone.utc),
     )
-    # Construct the return locally from merged values rather than re-SELECTing.
-    # created_at is preserved on update; for fresh inserts it defaults to `now`.
-    return GuildConfig(
-        guild_id=guild_id,
-        guild_name=guild_name,
-        scrape_channels=resolved_channels,
-        included_users=resolved_included,
-        scrape_start_date=resolved_start,
-        scrape_end_date=resolved_end,
-        default_limit=resolved_limit,
-        created_at=existing.created_at if existing else now,
-        updated_at=now,
-    )
+    assert row is not None  # INSERT ... RETURNING * always produces a row
+    return _row_to_guild_config(row)
 
 
 async def get_guild_config(db: asyncpg.Connection, guild_id: int) -> GuildConfig | None:
@@ -282,19 +266,7 @@ async def get_guild_config(db: asyncpg.Connection, guild_id: int) -> GuildConfig
         "SELECT * FROM guild_config WHERE guild_id = $1",
         guild_id,
     )
-    if row is None:
-        return None
-    return GuildConfig(
-        guild_id=row["guild_id"],
-        guild_name=row["guild_name"],
-        scrape_channels=row["scrape_channels"],
-        included_users=row["included_users"],
-        scrape_start_date=row["scrape_start_date"],
-        scrape_end_date=row["scrape_end_date"],
-        default_limit=row["default_limit"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-    )
+    return _row_to_guild_config(row) if row else None
 
 
 async def reset_guild_config(db: asyncpg.Connection, guild_id: int) -> bool:
@@ -334,21 +306,21 @@ async def create_scrape_job(
     channels: list[int] | None = None,
 ) -> ScrapeJob:
     """Create a new scrape job. Caller wraps writes in a transaction."""
-    now = datetime.now(timezone.utc)
-
-    await db.execute(
+    row = await db.fetchrow(
         """
         INSERT INTO scrape_jobs (job_id, guild_id, status, channels,
                                  started_at, created_at)
         VALUES ($1, $2, $3, $4, $5, $5)
+        RETURNING *
         """,
         job_id,
         guild_id,
         JobStatus.RUNNING,
         channels or [],
-        now,
+        datetime.now(timezone.utc),
     )
-    return await get_scrape_job(db, job_id)  # type: ignore[return-value]
+    assert row is not None  # INSERT ... RETURNING * always produces a row
+    return _row_to_scrape_job(row)
 
 
 async def update_scrape_job_status(
