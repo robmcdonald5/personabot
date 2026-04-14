@@ -49,9 +49,9 @@ docker compose -f docker-compose.dev.yml ps
 docker compose -f docker-compose.dev.yml logs -f
 
 # Start the bot on the host (after Postgres is up)
-set -a && source .env.secret && set +a && poetry run python -m personabot.bot
+set -a && source .env.local && set +a && poetry run python -m personabot.bot
 # Powershell
-Get-Content .env.secret | ForEach-Object { $name, $value = $_ -split '=', 2; if ($name -and $value) { [System.Environment]::SetEnvironmentVariable($name.Trim(), $value.Trim()) } }; poetry run python -m personabot.bot
+Get-Content .env.local | ForEach-Object { $name, $value = $_ -split '=', 2; if ($name -and $value) { [System.Environment]::SetEnvironmentVariable($name.Trim(), $value.Trim()) } }; poetry run python -m personabot.bot
 
 # Ctrl+C kills the bot; Postgres keeps running.
 ```
@@ -294,7 +294,7 @@ docker system prune --volumes
 | `Container personabot_pg_dev is unhealthy` after start | Postgres failed to initialize | `docker logs personabot_pg_dev` to see why; usually bad env vars or corrupt volume |
 | `could not find migrations directory 'C:/Program Files/Git/db/migrations'` | Git Bash path translation | Prefix with `MSYS_NO_PATHCONV=1` |
 | Bot image runs old code after rebuild | Cached layer | `up -d --build` (not just `up -d`) |
-| `.env.secret` edits don't apply | Already-running bot process | Kill bot, re-source, re-run |
+| `.env.local` edits don't apply | Already-running bot process | Kill bot, re-source, re-run |
 
 ---
 
@@ -312,7 +312,7 @@ cd C:/Users/McDon/Repos/personabot
 TEST_DATABASE_URL="postgresql://personabot:dev@localhost:5433/personabot" poetry run pytest
 
 # 4. Does the bot boot cleanly?
-set -a && source .env.secret && set +a && poetry run python -m personabot.bot
+set -a && source .env.local && set +a && poetry run python -m personabot.bot
 # Expected: "Database pool created", "Schema reset", "Logged in as personabot#6949"
 # Ctrl+C to stop.
 ```
