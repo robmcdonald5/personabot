@@ -10,7 +10,11 @@ from personabot.db.manager import DatabaseManager
 def test_bot_instantiation():
     """Bot can be instantiated with required dependencies."""
     db_manager = MagicMock(spec=DatabaseManager)
-    settings = Settings(discord_token="fake")
+    settings = Settings(
+        discord_token="fake",
+        environment="development",
+        database_url="postgresql://test:test@localhost:5433/test",
+    )
 
     bot = PersonaBot(db_manager=db_manager, settings=settings)
 
@@ -21,7 +25,11 @@ def test_bot_instantiation():
 def test_bot_intents():
     """Bot declares the correct intents."""
     db_manager = MagicMock(spec=DatabaseManager)
-    settings = Settings(discord_token="fake")
+    settings = Settings(
+        discord_token="fake",
+        environment="development",
+        database_url="postgresql://test:test@localhost:5433/test",
+    )
 
     bot = PersonaBot(db_manager=db_manager, settings=settings)
 
@@ -32,7 +40,11 @@ def test_bot_intents():
 def test_bot_has_pb_group():
     """Bot has the /pb command group registered."""
     db_manager = MagicMock(spec=DatabaseManager)
-    settings = Settings(discord_token="fake")
+    settings = Settings(
+        discord_token="fake",
+        environment="development",
+        database_url="postgresql://test:test@localhost:5433/test",
+    )
 
     bot = PersonaBot(db_manager=db_manager, settings=settings)
 

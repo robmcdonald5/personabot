@@ -1,15 +1,11 @@
 """Stats cog — /pb stats commands for analytics."""
 
-import logging
-
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from personabot.bot.client import PersonaBot
 from personabot.db import queries
-
-logger = logging.getLogger(__name__)
 
 
 class StatsCog(commands.Cog):
@@ -33,8 +29,8 @@ class StatsCog(commands.Cog):
         guild = interaction.guild
         assert guild is not None  # Guaranteed by guild_only
 
-        db = self.bot.db
-        user_stats = await queries.get_user_stats(db, guild.id, user.id)
+        async with self.bot.db_conn() as db:
+            user_stats = await queries.get_user_stats(db, guild.id, user.id)
 
         if user_stats is None:
             await interaction.response.send_message(
@@ -75,8 +71,8 @@ class StatsCog(commands.Cog):
         guild = interaction.guild
         assert guild is not None  # Guaranteed by guild_only
 
-        db = self.bot.db
-        server_stats = await queries.get_server_stats(db, guild.id)
+        async with self.bot.db_conn() as db:
+            server_stats = await queries.get_server_stats(db, guild.id)
 
         embed = discord.Embed(
             title=f"Server Stats: {guild.name}",
@@ -117,8 +113,8 @@ class StatsCog(commands.Cog):
         assert guild is not None  # Guaranteed by guild_only
 
         n = min(max(n, 1), 25)
-        db = self.bot.db
-        top_users = await queries.get_top_users(db, guild.id, n)
+        async with self.bot.db_conn() as db:
+            top_users = await queries.get_top_users(db, guild.id, n)
 
         if not top_users:
             await interaction.response.send_message(

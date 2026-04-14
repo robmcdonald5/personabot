@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import logging
 from pathlib import Path
 
 import discord
@@ -10,6 +9,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from personabot.bot.client import PersonaBot
+from personabot.bot.cogs.scrape import fetch_job_choices
+from personabot.bot.views import ExportUserPickerView
 from personabot.db import queries
 from personabot.pipeline.export import (
     build_user_corpus,
@@ -18,8 +19,6 @@ from personabot.pipeline.export import (
 )
 from personabot.pipeline.scoring import score_and_rank
 from personabot.pipeline.windowing import create_windows, inject_reply_context
-
-logger = logging.getLogger(__name__)
 
 
 def _scan_exported_user_ids(guild_export_dir: Path) -> set[int]:
@@ -52,49 +51,181 @@ class ExportCog(commands.Cog):
         default_permissions=discord.Permissions(manage_guild=True),
     )
 
+    async def _job_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete for job_id:. Only shows jobs with stored data."""
+        return await fetch_job_choices(
+            self.bot,
+            interaction,
+            current,
+            predicate=lambda j: j.messages_stored > 0,
+            label=lambda j: (
+                f"{j.job_id} -- {j.status} ({j.messages_stored:,} stored)"
+            ),
+        )
+
     @export.command(name="generate", description="Export a user's corpus as JSONL")
     @app_commands.describe(
-        user="The user to export a corpus for",
-        budget="Token budget (default: 100000)",
+        job_id=(
+            "Optional: export only messages first captured by this specific "
+            "scrape (autocomplete). Omit to use every user currently in the DB."
+        ),
     )
+    @app_commands.autocomplete(job_id=_job_autocomplete)
     async def export_generate(
         self,
         interaction: discord.Interaction,
-        user: discord.Member,
-        budget: int | None = None,
+        job_id: str | None = None,
     ) -> None:
+        """Resolve the export target then run the pipeline.
+
+        When ``job_id`` is omitted, the command exports from every user
+        with stored messages in this guild (auto-picks single user,
+        shows a picker for multi-user). When ``job_id`` is provided,
+        every DB read is filtered by ``messages.job_id = job_id`` so the
+        result is exactly that scrape's captured corpus — per the
+        first-wins upsert semantic in ``queries._UPSERT_MESSAGE_SQL``.
+        """
         guild = interaction.guild
         assert guild is not None  # Guaranteed by guild_only
 
-        await interaction.response.send_message(
-            f"Exporting corpus for {user.mention}...", ephemeral=True
-        )
-
-        db = self.bot.db
-        settings = self.bot.settings
-        token_budget = budget or settings.token_budget
-
-        # 1. Fetch messages — distinguish "guild has never scraped" from
-        # "this specific user wasn't in the scraped data" for clearer UX.
-        messages = await queries.get_user_messages(db, guild.id, user.id)
-        if not messages:
-            job_count = await queries.count_scrape_jobs(db, guild.id)
-            if job_count == 0:
-                await interaction.followup.send(
-                    "No scrapes have been run for this server yet. "
-                    "Run `/pb scrape start` first.",
-                    ephemeral=True,
+        if job_id is not None:
+            # Authorization gate: `scrape_jobs.job_id` is a guild-blind PK
+            # (`secrets.token_hex(6)`) and Discord autocomplete is just a
+            # hint — a user can free-type any string. A cross-guild hit
+            # must look identical to "not found" so we don't leak the
+            # existence of jobs in other guilds.
+            async with self.bot.db_conn() as db:
+                job = await queries.get_scrape_job(db, job_id)
+            if job is None or job.guild_id != guild.id:
+                await interaction.response.send_message(
+                    f"Job `{job_id}` not found.", ephemeral=True
                 )
+                return
+
+        # n=25 matches Discord's Select max options.
+        async with self.bot.db_conn() as db:
+            top_users = await queries.get_top_users(db, guild.id, n=25, job_id=job_id)
+        if not top_users:
+            if job_id is not None:
+                await self._respond_empty_job(interaction, job_id)
             else:
-                await interaction.followup.send(
-                    f"No messages found for {user.mention}. They weren't in "
-                    "the scraped data — try `/pb scrape start` targeting that "
-                    "user, or adjust the scrape window and channels.",
-                    ephemeral=True,
-                )
+                await self._respond_empty_db(interaction, guild.id)
             return
 
-        # 2. Score and rank (CPU-intensive — run in thread)
+        if len(top_users) == 1:
+            tu = top_users[0]
+            member = guild.get_member(tu.author_id)
+            await interaction.response.defer(ephemeral=True)
+            await self._do_export(
+                interaction,
+                tu.author_id,
+                member.display_name if member else tu.author_name,
+                member.display_avatar.url if member else None,
+                job_id=job_id,
+            )
+            return
+
+        async def on_pick(picker_inter: discord.Interaction, picked_id: int) -> None:
+            await picker_inter.response.defer(ephemeral=True)
+            picked = next(tu for tu in top_users if tu.author_id == picked_id)
+            picked_member = guild.get_member(picked_id)
+            await self._do_export(
+                picker_inter,
+                picked_id,
+                picked_member.display_name if picked_member else picked.author_name,
+                picked_member.display_avatar.url if picked_member else None,
+                job_id=job_id,
+            )
+
+        picker = ExportUserPickerView(
+            author_id=interaction.user.id,
+            choices=[
+                (tu.author_id, tu.author_name, tu.message_count) for tu in top_users
+            ],
+            on_pick=on_pick,
+        )
+        if job_id is not None:
+            prompt = (
+                f"Job `{job_id}` captured messages from {len(top_users)} "
+                "users. Pick one to export:"
+            )
+        else:
+            prompt = (
+                f"The database has messages from {len(top_users)} users. "
+                "Pick one to export:"
+            )
+        await interaction.response.send_message(prompt, view=picker, ephemeral=True)
+        picker.message = await interaction.original_response()
+
+    async def _respond_empty_job(
+        self, interaction: discord.Interaction, job_id: str
+    ) -> None:
+        """Actionable error when a specific job_id has no stored messages."""
+        await interaction.response.send_message(
+            f"Job `{job_id}` has no stored messages in the retention window.",
+            ephemeral=True,
+        )
+
+    async def _respond_empty_db(
+        self, interaction: discord.Interaction, guild_id: int
+    ) -> None:
+        """Actionable error when the whole guild has no stored messages.
+
+        Distinguishes "this guild has never scraped" from "retention wiped
+        the last scrape's data" so the operator knows which button to push.
+        """
+        async with self.bot.db_conn() as db:
+            job_count = await queries.count_scrape_jobs(db, guild_id)
+        if job_count == 0:
+            await interaction.response.send_message(
+                "No scrapes have been run for this server yet. "
+                "Run `/pb scrape start` first.",
+                ephemeral=True,
+            )
+        else:
+            hours = self.bot.settings.retention_hours
+            await interaction.response.send_message(
+                f"No messages in the database. The {hours}-hour "
+                "retention window may have expired since the last "
+                "scrape — run `/pb scrape start` again.",
+                ephemeral=True,
+            )
+
+    async def _do_export(
+        self,
+        interaction: discord.Interaction,
+        user_id: int,
+        display_name: str,
+        avatar_url: str | None,
+        *,
+        job_id: str | None = None,
+    ) -> None:
+        """Run the full export pipeline for a resolved target user.
+
+        Caller must have already deferred the interaction — this method
+        always uses ``followup.send``. When ``job_id`` is provided, the
+        message fetch is filtered by job.
+        """
+        guild = interaction.guild
+        assert guild is not None
+        settings = self.bot.settings
+        token_budget = settings.token_budget
+
+        async with self.bot.db_conn() as db:
+            messages = await queries.get_user_messages(
+                db, guild.id, user_id, job_id=job_id
+            )
+        if not messages:
+            await interaction.followup.send(
+                f"No messages found for **{display_name}**. They weren't in "
+                "the scraped data — run `/pb scrape start` after editing "
+                "channels / included users / window.",
+                ephemeral=True,
+            )
+            return
+
         scored = await asyncio.to_thread(
             score_and_rank, messages, settings.top_n_messages
         )
@@ -102,51 +233,48 @@ class ExportCog(commands.Cog):
 
         if not scored:
             await interaction.followup.send(
-                f"No quality messages found for {user.mention} after filtering.",
+                f"No quality messages found for **{display_name}** after filtering.",
                 ephemeral=True,
             )
             return
 
-        # 3. Create conversation windows
         windows = create_windows(
             scored,
             gap_hours=settings.window_gap_hours,
-            target_author_id=user.id,
+            target_author_id=user_id,
         )
 
-        # 4. Inject reply context via targeted DB lookup (not full message dict)
         reply_ids = {
             wm.reply_to_id
             for w in windows
             for wm in w.messages
             if wm.reply_to_id is not None
         }
-        reply_context = await queries.get_messages_by_ids(db, reply_ids)
+        async with self.bot.db_conn() as db:
+            reply_context = await queries.get_messages_by_ids(db, reply_ids)
         inject_reply_context(windows, reply_context)
 
-        # 5. Token budget and corpus assembly
         selected = enforce_token_budget(windows, total_budget=token_budget)
         corpus = build_user_corpus(
-            user_id=user.id,
-            user_name=user.display_name,
+            user_id=user_id,
+            user_name=display_name,
             guild_id=guild.id,
             guild_name=guild.name,
             windows=selected,
         )
 
-        # 6. Export JSONL (blocking I/O — run in thread)
         export_file = await asyncio.to_thread(
             export_jsonl,
             corpus,
-            settings.export_path(guild.id, user.id),
+            settings.export_path(guild.id, user_id),
         )
 
-        # 7. Build result embed
         embed = discord.Embed(
-            title=f"Corpus Export: {user.display_name}",
+            title=f"Corpus Export: {display_name}",
             color=discord.Color.teal(),
         )
-        embed.set_thumbnail(url=user.display_avatar.url)
+        if avatar_url:
+            embed.set_thumbnail(url=avatar_url)
         embed.add_field(
             name="Messages", value=f"{corpus.total_messages:,}", inline=True
         )
@@ -167,13 +295,12 @@ class ExportCog(commands.Cog):
             text=f"Data expires in {hours} hours. Download this file to keep it."
         )
 
-        # 8. Send as Discord attachment (or fallback if too large)
         file_size = export_file.stat().st_size
         max_attachment = 25 * 1024 * 1024  # 25 MB
 
         if file_size <= max_attachment:
             discord_file = discord.File(
-                export_file, filename=f"{user.display_name}_corpus.jsonl"
+                export_file, filename=f"{display_name}_corpus.jsonl"
             )
             await interaction.followup.send(embed=embed, file=discord_file)
         else:
@@ -248,8 +375,8 @@ class ExportCog(commands.Cog):
         guild = interaction.guild
         assert guild is not None  # Guaranteed by guild_only
 
-        db = self.bot.db
-        top_users = await queries.get_top_users(db, guild.id, 25)
+        async with self.bot.db_conn() as db:
+            top_users = await queries.get_top_users(db, guild.id, 25)
 
         if not top_users:
             await interaction.response.send_message(

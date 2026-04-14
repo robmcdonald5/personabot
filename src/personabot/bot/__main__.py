@@ -15,7 +15,11 @@ def main() -> None:
 
     settings = get_settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    db_manager = DatabaseManager(db_path=settings.db_path)
+    # Dev mode rebuilds the schema on every startup; prod leaves it to dbmate.
+    db_manager = DatabaseManager(
+        database_url=settings.database_url,
+        reset_schema_on_connect=settings.is_development,
+    )
     bot = PersonaBot(db_manager=db_manager, settings=settings)
     bot.run(settings.discord_token)
 

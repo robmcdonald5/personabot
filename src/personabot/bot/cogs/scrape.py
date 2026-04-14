@@ -3,25 +3,58 @@
 import asyncio
 import logging
 import secrets
-from datetime import date, datetime, timedelta
+from collections.abc import Callable
+from datetime import datetime, timedelta
 from pathlib import Path
 
-import aiosqlite
+import asyncpg
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from personabot.bot.client import PersonaBot
-from personabot.bot.views import (
-    ChannelPickerView,
-    ScrapeWindowModal,
-    UserPickerView,
-    date_to_utc_midnight,
-)
+from personabot.bot.views import date_to_utc_midnight, parse_date_ymd
 from personabot.db import queries
 from personabot.schemas.discord import DiscordMessage, JobStatus
 
 logger = logging.getLogger(__name__)
+
+
+async def fetch_job_choices(
+    bot: PersonaBot,
+    interaction: discord.Interaction,
+    current: str,
+    *,
+    status_filter: JobStatus | None = None,
+    predicate: Callable[[queries.ScrapeJob], bool] | None = None,
+    label: Callable[[queries.ScrapeJob], str] = lambda j: (
+        f"{j.job_id} -- {j.status} ({j.messages_found:,} found)"
+    ),
+) -> list[app_commands.Choice[str]]:
+    """Build an autocomplete list of recent scrape jobs.
+
+    Shared by scrape's own `_status_autocomplete` / `_cancel_autocomplete`
+    and export's `_job_autocomplete`. ``predicate`` is an optional post-
+    fetch filter (export uses it to hide jobs with zero stored rows);
+    ``label`` formats each Choice name. DB errors return an empty list
+    so a transient failure just shows "no matches" instead of breaking
+    the UI.
+    """
+    if interaction.guild_id is None:
+        return []
+    try:
+        async with bot.db_conn() as db:
+            jobs = await queries.get_recent_scrape_jobs(
+                db, interaction.guild_id, status_filter=status_filter
+            )
+    except Exception:
+        logger.exception("Job autocomplete failed")
+        return []
+    return [
+        app_commands.Choice(name=label(j), value=j.job_id)
+        for j in jobs
+        if (predicate is None or predicate(j)) and current.lower() in j.job_id.lower()
+    ][:25]
 
 
 class ScrapeCog(commands.Cog):
@@ -52,154 +85,100 @@ class ScrapeCog(commands.Cog):
         default_permissions=discord.Permissions(manage_guild=True),
     )
 
-    @scrape.command(name="start", description="Start a message scrape job")
-    @app_commands.describe(
-        user=(
-            "Target a specific user. Overrides the configured include list "
-            "for this job."
-        ),
-        channel="Scrape only this channel (optional — uses configured channels)",
-        limit="Max messages to scrape (optional)",
+    @scrape.command(
+        name="start",
+        description="Run a message scrape using the saved guild config",
     )
-    async def scrape_start(
-        self,
-        interaction: discord.Interaction,
-        user: discord.Member | None = None,
-        channel: discord.TextChannel | None = None,
-        limit: int | None = None,
-    ) -> None:
+    async def scrape_start(self, interaction: discord.Interaction) -> None:
+        """Start a scrape using only the values saved via /pb config.
+
+        Errors with a missing-fields list if channels, included users, or
+        the scrape window are unset. No optional params — an operator who
+        wants to change what gets scraped edits the config first, then
+        re-runs this command.
+        """
         guild = interaction.guild
         assert guild is not None  # Guaranteed by guild_only
 
-        db = self.bot.db
-        cfg = await queries.get_guild_config(db, guild.id)
+        async with self.bot.db_conn() as db:
+            cfg = await queries.get_guild_config(db, guild.id)
 
-        if channel:
-            channel_ids = [channel.id]
-        elif cfg and cfg.scrape_channels:
-            channel_ids = cfg.scrape_channels
-        else:
-            # No channels configured — offer an inline picker instead of a
-            # plain-text error. User must re-run the command after saving.
-            async def save_channels(ids: list[int]) -> None:
-                await queries.upsert_guild_config(
-                    db,
-                    guild_id=guild.id,
-                    guild_name=guild.name,
-                    scrape_channels=ids,
-                )
-                await db.commit()
+        missing: list[str] = []
+        if cfg is None or not cfg.scrape_channels:
+            missing.append("channels (`/pb config set-channels`)")
+        if cfg is None or not cfg.included_users:
+            missing.append("included users (`/pb config set-included-users`)")
+        if cfg is None or not cfg.scrape_start_date or not cfg.scrape_end_date:
+            missing.append("scrape window (`/pb config set-window`)")
 
-            channel_picker = ChannelPickerView(
-                author_id=interaction.user.id, on_confirm=save_channels
-            )
+        if missing:
             await interaction.response.send_message(
-                "No channels configured. Select channels to scrape below, "
-                "then re-run `/pb scrape start`:",
-                view=channel_picker,
+                "Missing required configuration:\n- "
+                + "\n- ".join(missing)
+                + "\n\nRun `/pb config setup` to configure everything "
+                "sequentially, or run the individual commands above.",
                 ephemeral=True,
             )
-            channel_picker.message = await interaction.original_response()
             return
 
-        # The include list is required. A per-invocation `user:` param is an
-        # explicit override and bypasses this gate (otherwise `user:@alice`
-        # would silently return zero messages when alice is not in the list).
-        if user is None and not (cfg and cfg.included_users):
+        # All required fields present — narrow cfg for the type checker.
+        assert cfg is not None
+        assert cfg.scrape_channels
+        assert cfg.included_users
+        assert cfg.scrape_start_date is not None
+        assert cfg.scrape_end_date is not None
 
-            async def save_users(ids: list[int]) -> None:
-                await queries.upsert_guild_config(
-                    db,
-                    guild_id=guild.id,
-                    guild_name=guild.name,
-                    included_users=ids,
-                )
-                await db.commit()
-
-            user_picker = UserPickerView(
-                author_id=interaction.user.id, on_confirm=save_users
-            )
+        try:
+            start_d = parse_date_ymd(cfg.scrape_start_date, "Saved start date")
+            end_d = parse_date_ymd(cfg.scrape_end_date, "Saved end date")
+        except ValueError as e:
             await interaction.response.send_message(
-                "No users configured for scraping. Select at least one user "
-                "to include, then re-run `/pb scrape start`:",
-                view=user_picker,
+                f"Saved scrape window is invalid: {e}\n"
+                "Re-run `/pb config set-window` to fix it.",
                 ephemeral=True,
             )
-            user_picker.message = await interaction.original_response()
             return
 
-        resolved_limit = (
-            limit
-            if limit is not None
-            else (cfg.default_limit if cfg else self.bot.settings.default_limit)
-        )
-        # Allowed user IDs for this scrape. `user:` param forces a single-user
-        # set; otherwise the gate above guarantees cfg.included_users is
-        # non-empty, so this set is always non-empty by the time _run_scrape
-        # reads it. Unifies both filter paths into one membership check.
-        if user is not None:
-            allowed_ids: set[int] = {user.id}
-        else:
-            assert cfg and cfg.included_users  # enforced by gate above
-            allowed_ids = set(cfg.included_users)
+        start_dt = date_to_utc_midnight(start_d)
+        end_dt = date_to_utc_midnight(end_d + timedelta(days=1))
+        allowed_ids: set[int] = set(cfg.included_users)
+        resolved_limit = cfg.default_limit
+        channel_ids = cfg.scrape_channels
 
-        # The modal's `required=True` TextInputs structurally enforce the
-        # "a window must be set" rule, so there is no separate error path
-        # for an unconfigured window.
-        async def launch_job(
-            modal_inter: discord.Interaction, start_d: date, end_d: date
-        ) -> None:
-            start_dt = date_to_utc_midnight(start_d)
-            end_dt = date_to_utc_midnight(end_d + timedelta(days=1))
-
-            job_id = secrets.token_hex(6)
-            # Only auto-create the FK parent row when no config exists yet —
-            # avoids a 2-query no-op upsert on every scrape in a configured
-            # guild. Needed for case: `cfg is None` + explicit `channel` arg.
-            if cfg is None:
-                await queries.upsert_guild_config(db, guild.id, guild.name)
+        job_id = secrets.token_hex(6)
+        async with self.bot.db_conn() as db, db.transaction():
             await queries.create_scrape_job(
                 db,
                 job_id=job_id,
                 guild_id=guild.id,
-                target_user_id=user.id if user else None,
                 channels=channel_ids,
             )
-            await db.commit()
 
-            target_str = user.mention if user else f"{len(allowed_ids)} included users"
-            await modal_inter.response.send_message(
-                f"Scrape job `{job_id}` started. "
-                f"Target: {target_str}, "
-                f"Channels: {len(channel_ids)}, "
-                f"Window: `{start_d.isoformat()}` → `{end_d.isoformat()}`, "
-                f"Limit: {resolved_limit:,}",
-                ephemeral=True,
-            )
-
-            cancel_event = asyncio.Event()
-            self._cancel_events[job_id] = cancel_event
-            task = asyncio.create_task(
-                self._run_scrape(
-                    job_id=job_id,
-                    guild=guild,
-                    channel_ids=channel_ids,
-                    allowed_ids=allowed_ids,
-                    limit=resolved_limit,
-                    start_dt=start_dt,
-                    end_dt=end_dt,
-                    notify_channel=modal_inter.channel,  # type: ignore[arg-type]
-                    cancel_event=cancel_event,
-                )
-            )
-            self._tasks[job_id] = task
-
-        modal = ScrapeWindowModal(
-            on_submit_callback=launch_job,
-            default_start=cfg.scrape_start_date if cfg else None,
-            default_end=cfg.scrape_end_date if cfg else None,
+        await interaction.response.send_message(
+            f"Scrape job `{job_id}` started. "
+            f"Target: {len(allowed_ids)} included users, "
+            f"Channels: {len(channel_ids)}, "
+            f"Window: `{start_d.isoformat()}` → `{end_d.isoformat()}`, "
+            f"Limit: {resolved_limit:,}",
+            ephemeral=True,
         )
-        await interaction.response.send_modal(modal)
+
+        cancel_event = asyncio.Event()
+        self._cancel_events[job_id] = cancel_event
+        task = asyncio.create_task(
+            self._run_scrape(
+                job_id=job_id,
+                guild=guild,
+                channel_ids=channel_ids,
+                allowed_ids=allowed_ids,
+                limit=resolved_limit,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                notify_channel=interaction.channel,  # type: ignore[arg-type]
+                cancel_event=cancel_event,
+            )
+        )
+        self._tasks[job_id] = task
 
     async def _run_scrape(
         self,
@@ -224,8 +203,12 @@ class ScrapeCog(commands.Cog):
         datetime bounds passed to `channel.history(after=..., before=...)`.
         discord.py auto-sets `oldest_first=True` when `after` is set, so the
         global `limit` caps from the oldest end of the window.
+
+        Pool-hygiene note: every DB operation here uses its own short-lived
+        ``async with self.bot.db_conn() as db, db.transaction():`` block.
+        Holding one pool connection for the multi-minute scrape duration
+        would starve other cog commands sharing the same max=10 pool.
         """
-        db = self.bot.db
         media_threshold = self.bot.settings.media_reaction_threshold
         total_found = 0
         total_stored = 0
@@ -279,11 +262,6 @@ class ScrapeCog(commands.Cog):
                     )
                     batch.append(dm)
 
-                    # Download media for messages meeting reaction threshold.
-                    # Images for a single message download concurrently; the
-                    # scrape loop still awaits completion so per-message
-                    # ordering and media-row commits stay consistent with the
-                    # message upsert batch below.
                     if dm.reaction_count >= media_threshold and message.attachments:
                         images = [
                             att
@@ -294,49 +272,53 @@ class ScrapeCog(commands.Cog):
                         if images:
                             await asyncio.gather(
                                 *(
-                                    self._download_media(db, message.id, guild.id, att)
+                                    self._download_media(message.id, guild.id, att)
                                     for att in images
                                 )
                             )
 
-                    # Batch upsert every 100 messages
                     if len(batch) >= 100:
-                        stored = await queries.upsert_messages_batch(db, batch)
+                        async with self.bot.db_conn() as db, db.transaction():
+                            stored = await queries.upsert_messages_batch(
+                                db, batch, job_id=job_id
+                            )
                         total_stored += stored
                         batch.clear()
-                        await db.commit()
 
-                    # Progress update every 500 messages
                     if total_found > 0 and total_found % 500 == 0:
-                        await queries.update_scrape_job_status(
-                            db,
-                            job_id,
-                            JobStatus.RUNNING,
-                            messages_found=total_found,
-                            messages_stored=total_stored,
-                        )
+                        async with self.bot.db_conn() as db, db.transaction():
+                            await queries.update_scrape_job_status(
+                                db,
+                                job_id,
+                                JobStatus.RUNNING,
+                                messages_found=total_found,
+                                messages_stored=total_stored,
+                            )
                         if notify_channel is not None:
                             await notify_channel.send(
                                 f"Scrape `{job_id}`: {total_found:,} messages "
                                 f"found, {total_stored:,} stored..."
                             )
 
-            # Flush remaining batch
+            # Flush remaining batch.
             if batch:
-                stored = await queries.upsert_messages_batch(db, batch)
+                async with self.bot.db_conn() as db, db.transaction():
+                    stored = await queries.upsert_messages_batch(
+                        db, batch, job_id=job_id
+                    )
                 total_stored += stored
 
             status = (
                 JobStatus.CANCELLED if cancel_event.is_set() else JobStatus.COMPLETED
             )
-            await queries.update_scrape_job_status(
-                db,
-                job_id,
-                status,
-                messages_found=total_found,
-                messages_stored=total_stored,
-            )
-            await db.commit()
+            async with self.bot.db_conn() as db, db.transaction():
+                await queries.update_scrape_job_status(
+                    db,
+                    job_id,
+                    status,
+                    messages_found=total_found,
+                    messages_stored=total_stored,
+                )
 
             if notify_channel is not None:
                 msg = (
@@ -354,15 +336,15 @@ class ScrapeCog(commands.Cog):
         except Exception as e:
             logger.error("Scrape job %s failed: %s", job_id, e)
             try:
-                await queries.update_scrape_job_status(
-                    db,
-                    job_id,
-                    JobStatus.FAILED,
-                    error_message=str(e),
-                    messages_found=total_found,
-                    messages_stored=total_stored,
-                )
-                await db.commit()
+                async with self.bot.db_conn() as db, db.transaction():
+                    await queries.update_scrape_job_status(
+                        db,
+                        job_id,
+                        JobStatus.FAILED,
+                        error_message=str(e),
+                        messages_found=total_found,
+                        messages_stored=total_stored,
+                    )
             except Exception:
                 logger.exception("Failed to update job %s status to FAILED", job_id)
             if notify_channel is not None:
@@ -377,12 +359,17 @@ class ScrapeCog(commands.Cog):
 
     async def _download_media(
         self,
-        db: aiosqlite.Connection,
         message_id: int,
         guild_id: int,
         attachment: discord.Attachment,
     ) -> None:
-        """Download a media attachment to local storage."""
+        """Download a media attachment to local storage and record it.
+
+        Acquires its own short-lived pool connection for the DB insert —
+        the caller (``_run_scrape``) does NOT pass a connection in. A
+        download failure at the DB level is logged and swallowed so one
+        bad media row does not abort an entire scrape batch.
+        """
         local_dir = self.bot.settings.media_dir / str(guild_id) / str(message_id)
         await asyncio.to_thread(local_dir.mkdir, parents=True, exist_ok=True)
         safe_name = Path(attachment.filename).name  # Strip any directory components
@@ -395,56 +382,31 @@ class ScrapeCog(commands.Cog):
             return
 
         try:
-            await queries.save_downloaded_media(
-                db,
-                message_id=message_id,
-                guild_id=guild_id,
-                original_url=attachment.url,
-                local_path=str(local_path),
-                content_type=attachment.content_type,
-                file_size=attachment.size,
-            )
-        except aiosqlite.Error as e:
+            async with self.bot.db_conn() as db, db.transaction():
+                await queries.save_downloaded_media(
+                    db,
+                    message_id=message_id,
+                    guild_id=guild_id,
+                    original_url=attachment.url,
+                    local_path=str(local_path),
+                    content_type=attachment.content_type,
+                    file_size=attachment.size,
+                )
+        except asyncpg.PostgresError as e:
             logger.warning("Failed to save media record for %s: %s", attachment.url, e)
 
-    async def _job_autocomplete(
-        self,
-        interaction: discord.Interaction,
-        current: str,
-        status_filter: JobStatus | None = None,
-    ) -> list[app_commands.Choice[str]]:
-        """Shared autocomplete for scrape job selectors."""
-        if interaction.guild_id is None:
-            return []
-        try:
-            jobs = await queries.get_recent_scrape_jobs(
-                self.bot.db, interaction.guild_id, status_filter=status_filter
-            )
-        except Exception:
-            logger.exception("Job autocomplete failed")
-            return []
-        return [
-            app_commands.Choice(
-                name=f"{j.job_id} -- {j.status} ({j.messages_found:,} found)",
-                value=j.job_id,
-            )
-            for j in jobs
-            if current.lower() in j.job_id.lower()
-        ][:25]
-
-    # discord.py validates autocomplete callbacks have exactly 2–3 params
-    # (self, interaction, current). _job_autocomplete has a 4th param
-    # (status_filter), so these thin wrappers are required — not dead code.
+    # discord.py's autocomplete callbacks must have exactly 2-3 params,
+    # so these are thin wrappers around the shared helper in autocomplete.py.
     async def _status_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        return await self._job_autocomplete(interaction, current)
+        return await fetch_job_choices(self.bot, interaction, current)
 
     async def _cancel_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        return await self._job_autocomplete(
-            interaction, current, status_filter=JobStatus.RUNNING
+        return await fetch_job_choices(
+            self.bot, interaction, current, status_filter=JobStatus.RUNNING
         )
 
     @scrape.command(name="status", description="Check scrape job status")
@@ -453,8 +415,8 @@ class ScrapeCog(commands.Cog):
     async def scrape_status(
         self, interaction: discord.Interaction, job_id: str
     ) -> None:
-        db = self.bot.db
-        job = await queries.get_scrape_job(db, job_id)
+        async with self.bot.db_conn() as db:
+            job = await queries.get_scrape_job(db, job_id)
 
         if job is None:
             await interaction.response.send_message(
