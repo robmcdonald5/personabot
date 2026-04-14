@@ -23,10 +23,12 @@ from personabot.pipeline.windowing import create_windows, inject_reply_context
 
 def _scan_exported_user_ids(guild_export_dir: Path) -> set[int]:
     """Return the set of user_ids that have a corpus.jsonl under a guild dir."""
-    if not guild_export_dir.exists():
-        return set()
     result: set[int] = set()
-    for user_dir in guild_export_dir.iterdir():
+    try:
+        entries = list(guild_export_dir.iterdir())
+    except FileNotFoundError:
+        return result
+    for user_dir in entries:
         if not user_dir.is_dir():
             continue
         if (user_dir / "corpus.jsonl").exists():
@@ -109,7 +111,11 @@ class ExportCog(commands.Cog):
             top_users = await queries.get_top_users(db, guild.id, n=25, job_id=job_id)
         if not top_users:
             if job_id is not None:
-                await self._respond_empty_job(interaction, job_id)
+                await interaction.response.send_message(
+                    f"Job `{job_id}` has no stored messages in the "
+                    "retention window.",
+                    ephemeral=True,
+                )
             else:
                 await self._respond_empty_db(interaction, guild.id)
             return
@@ -158,15 +164,6 @@ class ExportCog(commands.Cog):
             )
         await interaction.response.send_message(prompt, view=picker, ephemeral=True)
         picker.message = await interaction.original_response()
-
-    async def _respond_empty_job(
-        self, interaction: discord.Interaction, job_id: str
-    ) -> None:
-        """Actionable error when a specific job_id has no stored messages."""
-        await interaction.response.send_message(
-            f"Job `{job_id}` has no stored messages in the retention window.",
-            ephemeral=True,
-        )
 
     async def _respond_empty_db(
         self, interaction: discord.Interaction, guild_id: int
