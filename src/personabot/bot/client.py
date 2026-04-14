@@ -19,26 +19,13 @@ from personabot.db.manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
-# Cog extension module paths. The group name embedded in each cog's
-# app_commands.Group must match the last path component; setup_hook uses
-# this to re-parent cog groups under /pb after load_extension registers
-# them at top level. Cross-cog parent sharing is explicitly not supported
-# by discord.py (Rapptz #8069) — this tree manipulation is the only
-# approach that works without collapsing into a single GroupCog.
-_COG_EXTENSIONS: tuple[str, ...] = (
-    "personabot.bot.cogs.config",
-    "personabot.bot.cogs.scrape",
-    "personabot.bot.cogs.export",
-    "personabot.bot.cogs.stats",
-    "personabot.bot.cogs.db",
-)
-_COG_GROUP_NAMES: tuple[str, ...] = (
-    "config",
-    "scrape",
-    "export",
-    "stats",
-    "db",
-)
+# Cogs to load. Each name is both the last segment of the extension
+# module path AND the `name=` on that cog's class-level
+# `app_commands.Group`, so setup_hook can re-parent each group under /pb
+# without a second list. Cross-cog parent sharing is explicitly not
+# supported by discord.py (Rapptz #8069); this tree manipulation is the
+# only approach that works without collapsing into a single GroupCog.
+_COGS: tuple[str, ...] = ("config", "scrape", "export", "stats", "db")
 
 # Docker HEALTHCHECK looks for this sentinel file. on_ready touches it when
 # the bot is fully connected; on_disconnect removes it. The Dockerfile's
@@ -88,15 +75,14 @@ class PersonaBot(commands.Bot):
             async with self.bot.db_conn() as db, db.transaction():  # write
                 await queries.upsert_guild_config(db, ...)
         """
-        async with self.db_manager.db_conn() as conn:
+        async with self.db_manager.pool.acquire() as conn:
             yield conn
 
     async def save_guild_fields(self, guild: discord.Guild, **fields: Any) -> None:
         """Upsert one or more guild_config fields in a fresh transaction.
 
-        Collapses the "acquire + transaction + upsert_guild_config"
-        pattern shared by every picker callback in ``cogs/config.py``
-        and ``cogs/scrape.py``.
+        Collapses the acquire + transaction + ``upsert_guild_config``
+        pattern shared by every picker callback in ``cogs/config.py``.
         """
         async with self.db_conn() as db, db.transaction():
             await queries.upsert_guild_config(
@@ -108,14 +94,12 @@ class PersonaBot(commands.Bot):
         await self.db_manager.connect()
         logger.info("Database connected.")
 
-        for ext in _COG_EXTENSIONS:
-            await self.load_extension(ext)
-            logger.info("Loaded extension: %s", ext)
-
-        for name in _COG_GROUP_NAMES:
+        for name in _COGS:
+            await self.load_extension(f"personabot.bot.cogs.{name}")
             cmd = self.tree.remove_command(name)
             if cmd is not None:
                 self.pb.add_command(cmd)
+            logger.info("Loaded cog: %s", name)
         self.tree.add_command(self.pb)
 
         self.retention_cleanup.start()
