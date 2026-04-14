@@ -25,6 +25,28 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # Postgres service container. GitHub Actions spins this up on the
+    # host network before the job steps start, and the test suite reaches
+    # it via TEST_DATABASE_URL pointing at localhost:5432. The session-
+    # scoped db_pool fixture in tests/conftest.py picks it up via env var
+    # with a fallback to the docker-compose.dev.yml DSN on host port 5433.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: personabot
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: personabot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U personabot -d personabot_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgresql://personabot:ci@localhost:5432/personabot_test
+      ENVIRONMENT: development
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,6 +58,47 @@ jobs:
         run: poetry install
       - name: Run tests
         run: poetry run pytest -m "not integration"
+
+  integration:
+    runs-on: ubuntu-latest
+    # Same Postgres service, but a separate scratch DB. The integration
+    # test runs `dbmate up` against it, dumps the schema, and diffs
+    # against db/schema.sql — failing CI if create_tables() and dbmate
+    # drift apart. This is the structural guard for the heavy-dev mode
+    # DROP-on-startup path staying in lockstep with prod migrations.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: personabot
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: personabot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U personabot -d personabot_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgresql://personabot:ci@localhost:5432/personabot_test
+      ENVIRONMENT: development
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Poetry
+        run: pip install poetry
+      - name: Install dependencies
+        run: poetry install
+      - name: Install dbmate
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/dbmate \
+            https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64
+          sudo chmod +x /usr/local/bin/dbmate
+      - name: Run integration tests
+        run: poetry run pytest -m integration
 
   typecheck:
     runs-on: ubuntu-latest
