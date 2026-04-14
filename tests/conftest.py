@@ -6,27 +6,17 @@ schema. Per-test isolation uses an outer transaction + rollback — every
 test sees a clean database without the cost of recreating tables.
 """
 
-import json
 import os
 from typing import AsyncIterator
 
 import asyncpg
 import pytest_asyncio
 
+from personabot.db.manager import register_codecs
 from personabot.db.models import create_tables
 
 _DEFAULT_TEST_DSN = "postgresql://personabot:dev@localhost:5433/personabot"
 _TEST_DSN = os.getenv("TEST_DATABASE_URL", _DEFAULT_TEST_DSN)
-
-
-async def _register_codecs(conn: asyncpg.Connection) -> None:
-    """JSONB codec — mirror of ``db.manager._register_codecs``."""
-    await conn.set_type_codec(
-        "jsonb",
-        encoder=json.dumps,
-        decoder=json.loads,
-        schema="pg_catalog",
-    )
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -42,7 +32,7 @@ async def db_pool() -> AsyncIterator[asyncpg.Pool]:
         _TEST_DSN,
         min_size=1,
         max_size=5,
-        init=_register_codecs,
+        init=register_codecs,
     )
     assert pool is not None
     try:
