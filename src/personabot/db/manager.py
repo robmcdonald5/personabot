@@ -1,8 +1,8 @@
 """Database connection lifecycle management (asyncpg pool owner).
 
 This module owns the single ``asyncpg.Pool`` for the bot process. Cogs
-acquire via ``bot.db_conn()`` which delegates here. The pool is sized
-for a single-process Discord bot (``min=2, max=10``).
+acquire via ``bot.db_conn()`` which calls ``pool.acquire()`` directly.
+The pool is sized for a single-process Discord bot (``min=2, max=10``).
 
 In ``environment="development"`` ``connect()`` drops and recreates the
 schema on every startup. Production skips that path — dbmate migrations
@@ -13,8 +13,6 @@ own the schema via the ``migrate`` init container in
 import asyncio
 import json
 import logging
-from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
 import asyncpg
 
@@ -29,12 +27,13 @@ _POOL_MAX_SIZE = 10
 _POOL_CLOSE_TIMEOUT = 10.0
 
 
-async def _register_codecs(conn: asyncpg.Connection) -> None:
+async def register_codecs(conn: asyncpg.Connection) -> None:
     """Install the JSONB codec on a freshly-pooled connection.
 
     Without this, asyncpg treats JSONB columns as ``str`` — query
     functions would have to ``json.dumps``/``json.loads`` by hand. With
-    the codec, ``list[int] <-> jsonb`` is automatic.
+    the codec, ``list[int] <-> jsonb`` is automatic. Public so the test
+    suite can wire it into its own pool via ``init=`` without drift.
     """
     await conn.set_type_codec(
         "jsonb",
@@ -65,7 +64,7 @@ class DatabaseManager:
             self.database_url,
             min_size=_POOL_MIN_SIZE,
             max_size=_POOL_MAX_SIZE,
-            init=_register_codecs,
+            init=register_codecs,
         )
         logger.info(
             "Database pool created (min=%d max=%d)",
@@ -99,13 +98,3 @@ class DatabaseManager:
             self._pool.terminate()
         finally:
             self._pool = None
-
-    @asynccontextmanager
-    async def db_conn(self) -> AsyncIterator[asyncpg.Connection]:
-        """Acquire a pooled connection. Cog-facing shortcut::
-
-        async with bot.db_conn() as db, db.transaction():
-            await queries.upsert_guild_config(db, ...)
-        """
-        async with self.pool.acquire() as raw:
-            yield raw
