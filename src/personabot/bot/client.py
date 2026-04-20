@@ -89,6 +89,11 @@ class PersonaBot(commands.Bot):
                 db, guild_id=guild.id, guild_name=guild.name, **fields
             )
 
+    async def get_guild_config(self, guild_id: int) -> queries.GuildConfig | None:
+        """Read-side mirror of ``save_guild_fields`` — fresh conn, no txn."""
+        async with self.db_conn() as db:
+            return await queries.get_guild_config(db, guild_id)
+
     async def setup_hook(self) -> None:
         """Called before the bot connects. Load DB and cogs."""
         await self.db_manager.connect()

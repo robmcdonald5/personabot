@@ -133,8 +133,7 @@ class ConfigCog(commands.Cog):
     async def config_show(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None  # Guaranteed by guild_only
 
-        async with self.bot.db_conn() as db:
-            cfg = await queries.get_guild_config(db, interaction.guild.id)
+        cfg = await self.bot.get_guild_config(interaction.guild.id)
         if cfg is None:
             await interaction.response.send_message(
                 "No configuration found. Run `/pb config setup` to "
@@ -235,8 +234,7 @@ class ConfigCog(commands.Cog):
     )
     async def config_set_window(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
-        async with self.bot.db_conn() as db:
-            cfg = await queries.get_guild_config(db, interaction.guild.id)
+        cfg = await self.bot.get_guild_config(interaction.guild.id)
         await self._open_window_modal(
             interaction,
             default_start=cfg.scrape_start_date if cfg else None,

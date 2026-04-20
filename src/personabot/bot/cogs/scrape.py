@@ -102,8 +102,7 @@ class ScrapeCog(commands.Cog):
         guild = interaction.guild
         assert guild is not None  # Guaranteed by guild_only
 
-        async with self.bot.db_conn() as db:
-            cfg = await queries.get_guild_config(db, guild.id)
+        cfg = await self.bot.get_guild_config(guild.id)
 
         missing: list[str] = []
         if cfg is None or not cfg.scrape_channels:
