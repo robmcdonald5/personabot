@@ -383,25 +383,18 @@ async def get_recent_scrape_jobs(
     status_filter: JobStatus | None = None,
     limit: int = 25,
 ) -> list[ScrapeJob]:
-    """Fetch recent scrape jobs for a guild, optionally filtered by status.
-
-    Unlike SQLite's ``?`` placeholders, Postgres ``$N`` positions are fixed
-    by the query string — we renumber manually as the WHERE clause grows.
-    """
+    """Fetch recent scrape jobs for a guild, optionally filtered by status."""
+    clauses = ["guild_id = $1"]
+    params: list[Any] = [guild_id]
     if status_filter is not None:
-        query = (
-            "SELECT * FROM scrape_jobs "
-            "WHERE guild_id = $1 AND status = $2 "
-            "ORDER BY created_at DESC LIMIT $3"
-        )
-        rows = await db.fetch(query, guild_id, status_filter, limit)
-    else:
-        query = (
-            "SELECT * FROM scrape_jobs "
-            "WHERE guild_id = $1 "
-            "ORDER BY created_at DESC LIMIT $2"
-        )
-        rows = await db.fetch(query, guild_id, limit)
+        clauses.append(f"status = ${len(params) + 1}")
+        params.append(status_filter)
+    query = (
+        f"SELECT * FROM scrape_jobs WHERE {' AND '.join(clauses)} "
+        f"ORDER BY created_at DESC LIMIT ${len(params) + 1}"
+    )
+    params.append(limit)
+    rows = await db.fetch(query, *params)
     return [_row_to_scrape_job(row) for row in rows]
 
 

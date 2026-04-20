@@ -130,7 +130,7 @@ async def test_upsert_guild_config_preserves_new_fields(db_connection):
         scrape_start_date="2024-01-15",
         scrape_end_date="2024-06-30",
     )
-    # Update an unrelated field — v2 fields should survive
+    # Update only scrape_channels — other fields must be preserved on upsert.
     updated = await queries.upsert_guild_config(
         db_connection,
         guild_id=100,
