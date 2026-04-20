@@ -159,6 +159,20 @@ ALTER TABLE ONLY public.scrape_jobs
 
 
 --
+-- Name: idx_media_downloaded_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_media_downloaded_at ON public.downloaded_media USING btree (downloaded_at);
+
+
+--
+-- Name: idx_media_guild; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_media_guild ON public.downloaded_media USING btree (guild_id);
+
+
+--
 -- Name: idx_media_message; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -170,6 +184,13 @@ CREATE INDEX idx_media_message ON public.downloaded_media USING btree (message_i
 --
 
 CREATE INDEX idx_messages_channel ON public.messages USING btree (guild_id, channel_id, "timestamp");
+
+
+--
+-- Name: idx_messages_created_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_messages_created_at ON public.messages USING btree (created_at);
 
 
 --

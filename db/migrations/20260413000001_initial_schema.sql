@@ -1,30 +1,22 @@
 -- migrate:up
 
--- Initial Postgres schema for PersonaBot, frozen from `src/personabot/db/models.py`
--- at the end of the SQLite → Postgres migration (Phase 2).
+-- Initial Postgres schema for PersonaBot. Production applies this via the
+-- `migrate` init container in `docker-compose.prod.yml` (dbmate). Dev skips
+-- this path — `db/manager.py::create_tables` runs a DROP + CREATE on every
+-- startup, gated on ENVIRONMENT=development.
 --
--- In production this migration is applied by the `migrate` init container in
--- `docker-compose.prod.yml` via dbmate. In development the bot skips this
--- path entirely — `db/manager.py` calls `create_tables()` which runs a
--- DROP + CREATE on every startup (`ENVIRONMENT=development` gate).
+-- `db/models.py::_CREATE_SQL` and this file must stay bit-for-bit identical;
+-- `tests/integration/test_migrations.py` diffs them in CI.
 --
--- Keep `db/models.py::_CREATE_SQL` and this migration bit-for-bit identical.
--- Phase 7 adds a CI integration test that diffs the two automatically; for
--- now a manual parity check runs at the end of Phase 3.
---
--- Key design points preserved from Phase 2:
---   * All Discord ID columns are BIGINT (Discord snowflakes overflow 32-bit).
+-- Load-bearing design points:
+--   * All Discord ID columns are BIGINT — INTEGER truncates 19-digit snowflakes.
 --   * `messages.guild_id` is intentionally NOT a foreign key — scraped
 --     messages must survive guild_config churn; retention deletes messages
 --     on a time axis independent of config.
---   * JSON columns are JSONB (not TEXT); the asyncpg JSONB codec is
---     registered in `db/manager._register_codecs` so query functions pass
---     real Python lists.
---   * `messages.timestamp` stays TEXT (stored as ISO string in
---     `DiscordMessage.timestamp: str` — changing this cascades into the
---     export pipeline).
---   * `is_pinned` is BOOLEAN (was INTEGER 0/1 in SQLite).
---   * `downloaded_media.media_id` is BIGINT GENERATED ALWAYS AS IDENTITY.
+--   * JSON columns are JSONB; the asyncpg JSONB codec is registered in
+--     `db/manager.register_codecs` so query functions pass real Python lists.
+--   * `messages.timestamp` is TEXT (ISO string in `DiscordMessage.timestamp`
+--     — changing this cascades into the export pipeline).
 
 CREATE TABLE guild_config (
     guild_id          BIGINT PRIMARY KEY,
@@ -88,6 +80,9 @@ CREATE INDEX idx_messages_reply
     ON messages(reply_to_id) WHERE reply_to_id IS NOT NULL;
 CREATE INDEX idx_messages_job
     ON messages(guild_id, job_id) WHERE job_id IS NOT NULL;
+-- Supports the hourly retention sweep (delete_expired_messages).
+CREATE INDEX idx_messages_created_at
+    ON messages(created_at);
 
 CREATE TABLE downloaded_media (
     media_id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -103,6 +98,12 @@ CREATE TABLE downloaded_media (
 
 CREATE INDEX idx_media_message
     ON downloaded_media(message_id);
+-- Supports the retention sweep (delete_expired_media).
+CREATE INDEX idx_media_downloaded_at
+    ON downloaded_media(downloaded_at);
+-- Supports /pb db reset (reset_guild_data), which DELETEs by guild_id.
+CREATE INDEX idx_media_guild
+    ON downloaded_media(guild_id);
 
 -- migrate:down
 

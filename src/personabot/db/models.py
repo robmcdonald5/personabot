@@ -97,6 +97,11 @@ CREATE INDEX idx_messages_reply
     ON messages(reply_to_id) WHERE reply_to_id IS NOT NULL;
 CREATE INDEX idx_messages_job
     ON messages(guild_id, job_id) WHERE job_id IS NOT NULL;
+-- Supports the hourly retention sweep (delete_expired_messages) — without
+-- this, the DELETE seq-scans the whole table and blocks concurrent scrape
+-- INSERTs for the duration.
+CREATE INDEX idx_messages_created_at
+    ON messages(created_at);
 
 CREATE TABLE downloaded_media (
     media_id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -112,6 +117,12 @@ CREATE TABLE downloaded_media (
 
 CREATE INDEX idx_media_message
     ON downloaded_media(message_id);
+-- Supports the retention sweep (delete_expired_media).
+CREATE INDEX idx_media_downloaded_at
+    ON downloaded_media(downloaded_at);
+-- Supports /pb db reset (reset_guild_data), which DELETEs by guild_id.
+CREATE INDEX idx_media_guild
+    ON downloaded_media(guild_id);
 """
 
 
