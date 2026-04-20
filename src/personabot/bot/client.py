@@ -2,10 +2,13 @@
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, AsyncIterator
 
-import aiosqlite
+import aiohttp
+import asyncpg
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -16,19 +19,18 @@ from personabot.db.manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
-# Cog extension module paths. The group name embedded in each cog's
-# app_commands.Group must match the last path component; setup_hook uses
-# this to re-parent cog groups under /pb after load_extension registers
-# them at top level. Cross-cog parent sharing is explicitly not supported
-# by discord.py (Rapptz #8069) — this tree manipulation is the only
-# approach that works without collapsing into a single GroupCog.
-_COG_EXTENSIONS: tuple[str, ...] = (
-    "personabot.bot.cogs.config",
-    "personabot.bot.cogs.scrape",
-    "personabot.bot.cogs.export",
-    "personabot.bot.cogs.stats",
-)
-_COG_GROUP_NAMES: tuple[str, ...] = ("config", "scrape", "export", "stats")
+# Cogs to load. Each name is both the last segment of the extension
+# module path AND the `name=` on that cog's class-level
+# `app_commands.Group`, so setup_hook can re-parent each group under /pb
+# without a second list. Cross-cog parent sharing is explicitly not
+# supported by discord.py (Rapptz #8069); this tree manipulation is the
+# only approach that works without collapsing into a single GroupCog.
+_COGS: tuple[str, ...] = ("config", "scrape", "export", "stats", "db")
+
+# Docker HEALTHCHECK looks for this sentinel file. on_ready touches it when
+# the bot is fully connected; on_disconnect removes it. The Dockerfile's
+# HEALTHCHECK directive tests its existence — no HTTP surface needed.
+_HEALTH_SENTINEL = Path("/tmp/healthy")
 
 
 class PersonaBot(commands.Bot):
@@ -50,6 +52,10 @@ class PersonaBot(commands.Bot):
 
         self.db_manager = db_manager
         self.settings = settings
+        # Lazy-initialized on first healthcheck ping. One process-wide
+        # session beats recreating one per retention tick — aiohttp docs
+        # explicitly warn against the short-lived-session pattern.
+        self._http_session: aiohttp.ClientSession | None = None
 
         # Shared /pb parent group. Cog subgroups are re-parented under this
         # in setup_hook since discord.py forbids cross-cog parent references.
@@ -57,24 +63,48 @@ class PersonaBot(commands.Bot):
             name="pb", description="PersonaBot commands", guild_only=True
         )
 
-    @property
-    def db(self) -> aiosqlite.Connection:
-        """Shortcut for the shared aiosqlite connection."""
-        return self.db_manager.get_connection()
+    @asynccontextmanager
+    async def db_conn(self) -> AsyncIterator[asyncpg.Connection]:
+        """Acquire a pooled DB connection.
+
+        Usage::
+
+            async with self.bot.db_conn() as db:                    # read-only
+                row = await queries.get_guild_config(db, guild_id)
+
+            async with self.bot.db_conn() as db, db.transaction():  # write
+                await queries.upsert_guild_config(db, ...)
+        """
+        async with self.db_manager.pool.acquire() as conn:
+            yield conn
+
+    async def save_guild_fields(self, guild: discord.Guild, **fields: Any) -> None:
+        """Upsert one or more guild_config fields in a fresh transaction.
+
+        Collapses the acquire + transaction + ``upsert_guild_config``
+        pattern shared by every picker callback in ``cogs/config.py``.
+        """
+        async with self.db_conn() as db, db.transaction():
+            await queries.upsert_guild_config(
+                db, guild_id=guild.id, guild_name=guild.name, **fields
+            )
+
+    async def get_guild_config(self, guild_id: int) -> queries.GuildConfig | None:
+        """Read-side mirror of ``save_guild_fields`` — fresh conn, no txn."""
+        async with self.db_conn() as db:
+            return await queries.get_guild_config(db, guild_id)
 
     async def setup_hook(self) -> None:
         """Called before the bot connects. Load DB and cogs."""
         await self.db_manager.connect()
         logger.info("Database connected.")
 
-        for ext in _COG_EXTENSIONS:
-            await self.load_extension(ext)
-            logger.info("Loaded extension: %s", ext)
-
-        for name in _COG_GROUP_NAMES:
+        for name in _COGS:
+            await self.load_extension(f"personabot.bot.cogs.{name}")
             cmd = self.tree.remove_command(name)
             if cmd is not None:
                 self.pb.add_command(cmd)
+            logger.info("Loaded cog: %s", name)
         self.tree.add_command(self.pb)
 
         self.retention_cleanup.start()
@@ -117,45 +147,66 @@ class PersonaBot(commands.Bot):
     async def close(self) -> None:
         """Clean shutdown."""
         self.retention_cleanup.cancel()
+        _HEALTH_SENTINEL.unlink(missing_ok=True)
+        if self._http_session is not None:
+            await self._http_session.close()
+            self._http_session = None
         await self.db_manager.close()
         logger.info("Database closed.")
         await super().close()
 
     async def on_ready(self) -> None:
-        """Log when the bot is ready."""
+        """Log when the bot is ready and mark the container healthy."""
         logger.info(
             "Logged in as %s (ID: %s)",
             self.user,
             self.user.id if self.user else "?",
         )
+        # Touch the sentinel file so the Dockerfile HEALTHCHECK reports
+        # healthy. This fires every time discord.py raises on_ready, which
+        # happens after gateway resumption as well, so reconnect recoveries
+        # re-mark healthy automatically.
+        try:
+            _HEALTH_SENTINEL.touch(exist_ok=True)
+        except OSError as e:
+            # /tmp should always be writable in Docker, but don't crash
+            # the bot over a healthcheck corner case on dev machines.
+            logger.warning("Could not touch health sentinel: %s", e)
+
+    async def on_disconnect(self) -> None:
+        """Clear the health sentinel on gateway disconnect.
+
+        Paired with ``on_ready`` above. If discord.py's reconnect logic
+        drops us (rate-limit, token invalidation, network blip), Docker's
+        next healthcheck tick sees the missing sentinel and marks the
+        container unhealthy. An automatic reconnect will fire on_ready
+        again and re-mark healthy.
+        """
+        _HEALTH_SENTINEL.unlink(missing_ok=True)
 
     @tasks.loop(hours=1)
     async def retention_cleanup(self) -> None:
-        """Purge scraped data older than retention_hours."""
+        """Purge scraped data older than retention_hours.
+
+        Runs all SQL under one transaction on a single acquired connection,
+        releases it, then does the filesystem sweep in a thread with no DB
+        connection held — so the multi-second filesystem I/O doesn't pin a
+        pool slot and starve other writers.
+        """
         try:
-            db = self.db
             cutoff_dt = datetime.now(timezone.utc) - timedelta(
                 hours=self.settings.retention_hours
             )
-            cutoff = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            async with self.db_conn() as db, db.transaction():
+                expired_paths = await queries.delete_expired_media(db, cutoff_dt)
+                msg_count = await queries.delete_expired_messages(db, cutoff_dt)
+                job_count = await queries.delete_expired_scrape_jobs(db, cutoff_dt)
+
             cutoff_ts = cutoff_dt.timestamp()
-
-            # 1. Delete expired media (must be before messages — FK constraint)
-            expired_paths = await queries.delete_expired_media(db, cutoff)
-
-            # 2. Delete expired messages
-            msg_count = await queries.delete_expired_messages(db, cutoff)
-            await db.commit()  # Commit media + message deletions
-
-            # 3. Delete expired scrape jobs + 4. Clean up expired export files
-            # Run concurrently (no FK dependency between jobs and exports)
-            job_count, export_count = await asyncio.gather(
-                queries.delete_expired_scrape_jobs(db, cutoff),
-                self._cleanup_expired_files(
-                    expired_paths, cutoff_ts, self.settings.exports_dir
-                ),
+            export_count = await self._cleanup_expired_files(
+                expired_paths, cutoff_ts, self.settings.exports_dir
             )
-            await db.commit()  # Commit job deletions
 
             if expired_paths or msg_count or job_count or export_count:
                 logger.info(
@@ -167,8 +218,31 @@ class PersonaBot(commands.Bot):
                     export_count,
                 )
 
+            # Dead-man-switch ping on clean ticks only — exceptions are
+            # caught below and skip the ping so Healthchecks.io registers
+            # the miss and alerts.
+            await self._ping_healthcheck()
+
         except Exception:
             logger.exception("Retention cleanup failed")
+
+    async def _ping_healthcheck(self) -> None:
+        """GET settings.healthcheck_url with a hard 5s timeout.
+
+        A failed ping logs a warning and returns, so Healthchecks.io ping
+        failures never prevent the next retention tick from firing.
+        Reuses the process-wide ``self._http_session``, creating it on
+        first call.
+        """
+        url = self.settings.healthcheck_url
+        if not url:
+            return
+        if self._http_session is None:
+            self._http_session = aiohttp.ClientSession()
+        try:
+            await self._http_session.get(url, timeout=aiohttp.ClientTimeout(total=5))
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            logger.warning("Healthchecks.io ping failed", exc_info=True)
 
     @staticmethod
     async def _cleanup_expired_files(
@@ -177,7 +251,6 @@ class PersonaBot(commands.Bot):
         """Delete expired media files and export files. Runs I/O in a thread."""
 
         def _do_cleanup() -> int:
-            # Clean up media files from expired DB records
             for path_str in expired_paths:
                 p = Path(path_str)
                 p.unlink(missing_ok=True)
@@ -186,17 +259,17 @@ class PersonaBot(commands.Bot):
                 except OSError:
                     pass
 
-            # Clean up expired export files
+            # rglob on a missing directory yields an empty iterator, so no
+            # pre-check is needed.
             export_count = 0
-            if exports_dir.exists():
-                for jsonl_file in exports_dir.rglob("*.jsonl"):
-                    if jsonl_file.stat().st_mtime < cutoff_ts:
-                        jsonl_file.unlink()
-                        export_count += 1
-                        try:
-                            jsonl_file.parent.rmdir()
-                        except OSError:
-                            pass
+            for jsonl_file in exports_dir.rglob("*.jsonl"):
+                if jsonl_file.stat().st_mtime < cutoff_ts:
+                    jsonl_file.unlink()
+                    export_count += 1
+                    try:
+                        jsonl_file.parent.rmdir()
+                    except OSError:
+                        pass
             return export_count
 
         return await asyncio.to_thread(_do_cleanup)

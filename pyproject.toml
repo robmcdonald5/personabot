@@ -9,7 +9,7 @@ packages = [{include = "personabot", from = "src"}]
 [tool.poetry.dependencies]
 python = "^3.12"
 "discord.py" = ">=2.5,<3.0"
-aiosqlite = ">=0.20,<1.0"
+asyncpg = ">=0.29,<1.0"
 pydantic = ">=2.0,<3.0"
 pydantic-settings = ">=2.0,<3.0"
 
@@ -51,7 +51,7 @@ disallow_untyped_defs = false
 [[tool.mypy.overrides]]
 module = [
     "discord.*",
-    "aiosqlite.*",
+    "asyncpg.*",
 ]
 ignore_missing_imports = true
 
@@ -59,6 +59,13 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 pythonpath = ["src", "tests"]
 asyncio_mode = "auto"
+# Session-scoped default lets the session-scoped db_pool fixture and the
+# function-scoped db_connection fixture share a single asyncio event loop.
+# Without this, asyncpg connections created in session setup are pinned to
+# an event loop that has been torn down by the time a per-test fixture runs,
+# producing "another operation is in progress" InterfaceError.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 markers = [
     "integration: marks tests that require real API calls (deselect with '-m \"not integration\"')",
 ]

@@ -1,0 +1,103 @@
+# Production compose stack: postgres + dbmate migrate init container + bot.
+#
+# Deployment flow per docs/hetzner-deployment.md:
+#   1. Clone repo to /opt/personabot on the VM
+#   2. Fill in .env.prod (gitignored) from .env.prod.example
+#   3. docker compose -f docker-compose.prod.yml up -d
+#
+# Startup order:
+#   postgres starts → healthcheck passes → migrate runs dbmate up → exits
+#   0 → bot starts. Compose honors both `condition: service_healthy` and
+#   `condition: service_completed_successfully`, so no custom wait scripts
+#   are needed.
+#
+# The `${VAR:?required}` syntax is critical — if any of the four required
+# env vars is missing from .env.prod, Compose halts with a clear error
+# BEFORE starting any container. Without the `?required`, Compose would
+# silently substitute empty strings and Postgres would start with no
+# password, which is the second most-likely way to accidentally expose a
+# database to the world.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    # Postgres benefits from a larger /dev/shm for parallel workers and
+    # sort operations. 256MB is safe on any VM with >=2GB RAM and matches
+    # the Hetzner CX33 target.
+    shm_size: 256mb
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      POSTGRES_DB: ${POSTGRES_DB:?required}
+    volumes:
+      # Named volume lives on the host's Docker data-root (typically
+      # /var/lib/docker/volumes). Backup strategy in
+      # docs/hetzner-deployment.md is nightly pg_dump → Restic → Storage
+      # Box, NOT volume-level snapshots.
+      - pgdata:/var/lib/postgresql/data
+    # Loopback bind: the port is exposed on the host's 127.0.0.1:5432 so
+    # host-level tools (like the Netdata agent in the Hetzner doc) can
+    # scrape metrics locally, but external traffic is blocked by the
+    # Hetzner Cloud Firewall. The bot container reaches Postgres via the
+    # Compose bridge network using the service name, not via this port
+    # mapping — the port is purely a side door for on-host tooling.
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    command: >
+      postgres
+        -c statement_timeout=30s
+        -c idle_in_transaction_session_timeout=60s
+
+  # dbmate init container. Runs once, applies any unapplied migrations
+  # from db/migrations/, then exits. The bot container depends on this
+  # service's `service_completed_successfully` state so it cannot start
+  # before the schema is current.
+  migrate:
+    image: ghcr.io/amacneil/dbmate:latest
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+    volumes:
+      # Read-only bind mount: dbmate never writes back to the host in
+      # prod. schema.sql regeneration only happens during local dev.
+      - ./db/migrations:/db/migrations:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["--migrations-dir", "/db/migrations", "up"]
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # .env.prod is gitignored and lives on the deployment host. Compose
+    # reads it file-by-file rather than via the global `docker compose
+    # --env-file` flag so the shell variable-substitution above
+    # (${POSTGRES_USER:?required} etc.) works against the same file.
+    env_file: .env.prod
+    # Override DATABASE_URL explicitly so the bot container reaches
+    # Postgres via the service name on the bridge network, not
+    # localhost (the validator in config.py rejects localhost in prod).
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
+    volumes:
+      # Media downloads and export JSONLs. Survives container recreation
+      # so re-deploys don't wipe in-flight scrape state. The bot writes
+      # to /app/data/media/<guild>/<msg>/ and /app/data/exports/<guild>/<user>/.
+      - botdata:/app/data
+
+volumes:
+  pgdata:
+  botdata:

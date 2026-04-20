@@ -22,7 +22,11 @@ env/
 *~
 
 # Environment
+# Ignore all .env variants so secrets never land in git, but keep
+# committed templates (.env.*.example) which are safe reference material.
 .env
+.env.*
+!.env.*.example
 
 # Data & artifacts
 data/

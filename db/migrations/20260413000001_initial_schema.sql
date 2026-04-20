@@ -1,38 +1,23 @@
-"""Database table definitions (CREATE TABLE DDL) for Postgres.
+-- migrate:up
 
-Dev mode drops and recreates every table on startup so schema churn
-doesn't require a migration per change. Production schema is managed
-exclusively by ``db/migrations/*.sql`` via dbmate (see the ``migrate``
-init container in ``docker-compose.prod.yml``); the DROP path never
-fires there. When the schema stabilizes, stop passing ``drop_first=True``
-from ``DatabaseManager`` and delete ``_DROP_SQL``.
+-- Initial Postgres schema for PersonaBot. Production applies this via the
+-- `migrate` init container in `docker-compose.prod.yml` (dbmate). Dev skips
+-- this path — `db/manager.py::create_tables` runs a DROP + CREATE on every
+-- startup, gated on ENVIRONMENT=development.
+--
+-- `db/models.py::_CREATE_SQL` and this file must stay bit-for-bit identical;
+-- `tests/integration/test_migrations.py` diffs them in CI.
+--
+-- Load-bearing design points:
+--   * All Discord ID columns are BIGINT — INTEGER truncates 19-digit snowflakes.
+--   * `messages.guild_id` is intentionally NOT a foreign key — scraped
+--     messages must survive guild_config churn; retention deletes messages
+--     on a time axis independent of config.
+--   * JSON columns are JSONB; the asyncpg JSONB codec is registered in
+--     `db/manager.register_codecs` so query functions pass real Python lists.
+--   * `messages.timestamp` is TEXT (ISO string in `DiscordMessage.timestamp`
+--     — changing this cascades into the export pipeline).
 
-Discord ID columns are ``BIGINT`` — Postgres ``INTEGER`` is 32-bit and
-would silently truncate 17–19-digit Discord snowflakes. See
-``tests/db/test_bigint_ids.py`` for the regression guard.
-"""
-
-import asyncpg
-
-# DROP order is child-first: foreign keys on scrape_jobs and downloaded_media
-# reference parent rows, so dropping a parent before its children raises
-# ``cannot drop table ... because other objects depend on it`` with the
-# default RESTRICT behavior. We explicitly order the DROPs here rather than
-# rely on CASCADE so a typo in the child ordering surfaces loudly.
-_DROP_SQL = """
-DROP TABLE IF EXISTS downloaded_media;
-DROP TABLE IF EXISTS scrape_jobs;
-DROP TABLE IF EXISTS messages;
-DROP TABLE IF EXISTS guild_config;
-"""
-
-# ``messages.guild_id`` is intentionally NOT a foreign key. Scraped
-# messages must outlive guild_config churn (e.g. ``reset_guild_config``);
-# retention deletes messages independently on a time axis, and a
-# cascade-from-config would make that deletion path silently depend on
-# the FK. Other tables DO have FKs because their semantics are tied to
-# a parent row.
-_CREATE_SQL = """
 CREATE TABLE guild_config (
     guild_id          BIGINT PRIMARY KEY,
     guild_name        TEXT NOT NULL,
@@ -78,13 +63,11 @@ CREATE TABLE messages (
     attachment_count INTEGER NOT NULL DEFAULT 0,
     embed_count      INTEGER NOT NULL DEFAULT 0,
     word_count       INTEGER NOT NULL DEFAULT 0,
-    -- job_id is the scrape that FIRST captured this message. On a
-    -- subsequent re-scrape the ON CONFLICT UPDATE clause in
-    -- queries._UPSERT_MESSAGE_SQL leaves job_id alone (first-wins) so
-    -- /pb export generate job_id:X always returns the corpus that
-    -- scrape X originally discovered. No FK: scrape_jobs and messages
-    -- are retained on the same wall-clock, orphan job_id strings are
-    -- harmless (lookups return empty).
+    -- job_id is the scrape that FIRST captured this message. Subsequent
+    -- re-scrapes leave job_id alone (first-wins) so /pb export generate
+    -- job_id:X returns that specific scrape's corpus. No FK: scrape_jobs
+    -- and messages retain on the same wall-clock so orphan job_id strings
+    -- are harmless.
     job_id           TEXT,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -97,9 +80,7 @@ CREATE INDEX idx_messages_reply
     ON messages(reply_to_id) WHERE reply_to_id IS NOT NULL;
 CREATE INDEX idx_messages_job
     ON messages(guild_id, job_id) WHERE job_id IS NOT NULL;
--- Supports the hourly retention sweep (delete_expired_messages) — without
--- this, the DELETE seq-scans the whole table and blocks concurrent scrape
--- INSERTs for the duration.
+-- Supports the hourly retention sweep (delete_expired_messages).
 CREATE INDEX idx_messages_created_at
     ON messages(created_at);
 
@@ -123,17 +104,13 @@ CREATE INDEX idx_media_downloaded_at
 -- Supports /pb db reset (reset_guild_data), which DELETEs by guild_id.
 CREATE INDEX idx_media_guild
     ON downloaded_media(guild_id);
-"""
 
+-- migrate:down
 
-async def create_tables(db: asyncpg.Connection, *, drop_first: bool = False) -> None:
-    """Create all tables. Drops existing tables first iff ``drop_first``.
-
-    Callers in production must pass ``drop_first=False`` and should not
-    call this at all once dbmate is in place — schema there is managed by
-    migrations. Dev callers pass ``drop_first=True`` to rebuild from
-    scratch on every startup.
-    """
-    if drop_first:
-        await db.execute(_DROP_SQL)
-    await db.execute(_CREATE_SQL)
+-- Child-first drop order: scrape_jobs and downloaded_media both FK into
+-- their parents. `messages` has no FK despite being a logical child of
+-- guild_config (see _CREATE_SQL docstring for rationale).
+DROP TABLE IF EXISTS downloaded_media;
+DROP TABLE IF EXISTS scrape_jobs;
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS guild_config;
