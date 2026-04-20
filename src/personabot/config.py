@@ -1,11 +1,34 @@
 """Application configuration using pydantic-settings."""
 
+import ipaddress
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_LOCAL_HOSTNAMES = frozenset({"localhost", "localhost.localdomain"})
+
+
+def _is_local_dsn(dsn: str) -> bool:
+    """True if ``dsn``'s host component resolves to the local machine.
+
+    Covers named forms (``localhost``), IPv4 loopback (``127.0.0.0/8``),
+    IPv6 loopback (``::1`` / ``[::1]``), and the unspecified address
+    ``0.0.0.0`` — which a client library will typically route to local.
+    """
+    host = (urlparse(dsn).hostname or "").lower()
+    if not host:
+        return False
+    if host in _LOCAL_HOSTNAMES:
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_unspecified
 
 
 class Settings(BaseSettings):
@@ -52,15 +75,13 @@ class Settings(BaseSettings):
         service name (``postgres``), not ``localhost``, so this guard
         doesn't interfere with them.
         """
-        if self.is_production:
-            lowered = self.database_url.lower()
-            if "localhost" in lowered or "127.0.0.1" in lowered:
-                raise ValueError(
-                    "ENVIRONMENT=production + DATABASE_URL pointing at "
-                    "localhost is rejected as a cross-environment mixup "
-                    "guard. Either flip ENVIRONMENT=development or point "
-                    "DATABASE_URL at a real production host."
-                )
+        if self.is_production and _is_local_dsn(self.database_url):
+            raise ValueError(
+                "ENVIRONMENT=production + DATABASE_URL pointing at "
+                "localhost is rejected as a cross-environment mixup "
+                "guard. Either flip ENVIRONMENT=development or point "
+                "DATABASE_URL at a real production host."
+            )
         return self
 
     @property
@@ -88,7 +109,7 @@ class Settings(BaseSettings):
     auto_sync_commands: bool = True
 
     # Storage — all paths derived from data_dir. Media + export files live
-    # on disk; the SQLite db file no longer exists (Postgres owns row data).
+    # on disk; Postgres owns row data.
     data_dir: Path = Path("data")
 
     @property

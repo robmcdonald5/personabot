@@ -17,13 +17,23 @@ def test_production_rejects_localhost() -> None:
         )
 
 
-def test_production_rejects_127_0_0_1() -> None:
-    """ENVIRONMENT=production + DATABASE_URL containing '127.0.0.1' raises."""
+@pytest.mark.parametrize(
+    "host",
+    [
+        "127.0.0.1",
+        "127.0.0.2",  # whole 127/8 block is loopback
+        "[::1]",  # bracketed IPv6 loopback
+        "0.0.0.0",  # unspecified address — routes to local
+        "localhost.localdomain",
+    ],
+)
+def test_production_rejects_loopback_forms(host: str) -> None:
+    """ENVIRONMENT=production + any loopback-equivalent host raises."""
     with pytest.raises(ValueError, match="cross-environment mixup guard"):
         Settings(
             discord_token=_FAKE_DISCORD,
             environment="production",
-            database_url="postgresql://p:pw@127.0.0.1:5432/p",
+            database_url=f"postgresql://p:pw@{host}:5432/p",
         )
 
 
